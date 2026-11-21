@@ -136,3 +136,61 @@ Log with `mf.log(...)` (stderr). **Never `print()` to stdout**: it breaks the pr
 ## License
 
 MIT (see [LICENSE](LICENSE)). The kit files in `mechfight-kit/` come from the organizers.
+
+
+## Independent specialist learning (experimental)
+
+The eight functional parts of the bot can now be trained separately. These are learned
+selectors over behavior alternatives, rather than eight separate processes or language models.
+Only one module changes in each experiment; the rest of the current bot and the opponents stay fixed.
+
+| Module | Decisions learned | Additional task feedback |
+| --- | --- | --- |
+| perception | memory duration, bounded dead reckoning, trusting estimates | tracking quality against simulator labels |
+| targeting | nearest, weakest, attacker, clear shot, current targeting | damage dealt and eliminations |
+| strategy | cover, retreat, holding range, recovery, current strategy | health, survival, zone damage |
+| navigation | boost use, early unsticking, steering clearance | progress, stuck time, reaching the destination |
+| dodging | boost timing and cost, left/right evasions, current dodge | health and survival against lasers/mortars |
+| combat | firing tolerance and target lead | damage dealt, health and survival |
+| economy | health, weapons, cubes, supplies, current priorities | cubes, upgrades and equipment |
+| zone | when and how deeply to rotate, boost conservation | zone exposure, progress and survival |
+
+From the repository root:
+
+~~~sh
+# Train every module for 1,008 episodes each. Repeat to resume a partial run.
+python -B tools/train_specialists.py --run runs/specialists-v1 --episodes 1008 --workers 4
+
+# Inspect saved progress without starting training.
+python -B tools/train_specialists.py --run runs/specialists-v1 --status
+
+# Continue just combat to a TOTAL of 2,016 training episodes.
+python -B tools/train_specialists.py --run runs/specialists-v1 --modules combat --episodes 2016 --workers 4
+
+# Evaluate the selected models (or unpromoted candidates) on separate test seeds.
+python -B tools/train_specialists.py --run runs/specialists-v1 --test --eval-seeds 48 --workers 4
+
+# Run ONE experimental specialist on the game protocol; this does not change bot.py.
+python -B tools/specialist_bot.py --module combat --policy runs/specialists-v1/combat/candidate.json
+
+python -B tools/test_specialists.py
+~~~
+
+Each module has a directory under the run containing `state.json` (resume state),
+`candidate.json`, `history.jsonl`, and validation/test reports. A `champion.json` is written
+only when validation shows a positive approximate paired 95% lower bound, acceptable
+decision latency, and no more than one episode's survival regression versus baseline.
+Promotion means selection inside the experiment; it never activates the policy in `bot.py`.
+
+Training uses a small linear softmax actor and learned value baseline (REINFORCE), running on
+CPU with standard-library Python. A GPU is unnecessary for these 120-weight policies.
+Seed sets are separate for each module and for training, validation, and final testing.
+Changing source code requires a new run directory; increasing `--episodes` or changing
+`--workers` does not. Keep batch and validation settings unchanged when resuming training.
+Test sample count may differ from the validation sample count.
+
+Rewards are specialized proxies, not the official placement score. The simulator approximates
+the real game. Positive validation results need separate test confirmation, then full-match
+and real practice evaluation. Independently useful policies may also conflict when combined;
+this tool intentionally runs them one at a time. Evaluate a test set once after model selection;
+further tuning should use training/validation and reserve new test scenarios for a later audit.
