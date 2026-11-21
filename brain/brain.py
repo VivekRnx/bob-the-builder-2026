@@ -54,8 +54,21 @@ TUNING = {
     "safe_after_s": 4.0,          # "safe" = no damage taken and no enemy seen for this long
     "track_keep_s": 20.0,         # remember enemies this long after the server stops reporting them
     "time_guard_ms": 28.0,        # skip optional heavy work past this per-tick time
+    "heal_below_frac": 0.0,       # below this HP fraction with no enemy in view: stop farming, hide, regen (0 = off; lost in sim A/B)
+    "early_farm_s": 90.0,         # before this match time...
+    "early_farm_mult": 1.7,       # ...crates/cubes this much further away are worth a detour
+    "reload_quiet_s": 2.0,        # reload a non-full magazine once no enemy has been seen this long
+    "fight_boost_energy": 999.0,  # boost while strafing in a fight above this energy (999 = never)
     "debug": True,
 }
+
+# Local experiments only: MECH_TUNING='{"fight_boost_energy": 50}' overrides knobs (never set in a match).
+try:
+    import json as _json
+    import os as _os
+    TUNING.update(_json.loads(_os.environ.get("MECH_TUNING", "{}") or "{}"))
+except Exception:  # a bad override must never break the bot
+    pass
 
 # rough sustained DPS per weapon (base stats), used only to judge fights
 BASE_DPS = {"gun": 45 * 12 / (12 * 0.24 + 2.4), "laser": 315 / (1.65 + 0.75), "mortar": 230 / 2.6,
@@ -153,7 +166,9 @@ class Brain:
             enemy = None
             self.target_id = None
         safe = self.is_safe(obs)
-        farm = self.pick_farm_target(obs) if (enemy is None and safe) else None
+        # Regen needs regen_delay s without dealing OR taking damage: when hurt, don't shoot crates/drones.
+        healing = me["hp"] < TUNING["heal_below_frac"] * me["max_hp"] and enemy is None
+        farm = self.pick_farm_target(obs) if (enemy is None and safe and not healing) else None
         act.update(self.loot_action(obs))
 
         goal, urgent, mode, fight_move = self.decide(obs, enemy, farm, safe)
@@ -341,7 +356,10 @@ class Brain:
     def pick_farm_target(self, obs: mf.Observation) -> Optional[dict]:
         me = obs["self"]
         p = me["pos"]
-        best, bd = None, TUNING["crate_radius"]
+        # Early on (before the hunters arrive) cubes are worth a detour: 1 cube = +4% HP/damage and the
+        # first upgrade offer (plating, +15% max HP), which decides close duels.
+        early = TUNING["early_farm_mult"] if obs["t"] < TUNING["early_farm_s"] else 1.0
+        best, bd = None, TUNING["crate_radius"] * early
         for c in obs["crates"]:
             d = hdist(p, c["pos"])
             if d < bd and abs(c["pos"][2] - p[2]) < 20 and self.goal_ok(c["pos"]):
@@ -492,6 +510,20 @@ class Brain:
         if recently_hit:
             return zone_pt, False, "evade", False
 
+        # hurt and nobody in view: heal before the next hunter arrives. Hide from recently seen enemies
+        # (cubes/weapons right next to us are still fine: picking up deals no damage).
+        if hp_frac < TUNING["heal_below_frac"] and not farm:
+            recent = [tr for tr in self.tracks.values() if t - tr.t < 15.0]
+            near_cube = next((c for c in obs["cubes"] if hdist(p, c["pos"]) < 25 and abs(c["pos"][2] - p[2]) < 6
+                              and self.goal_ok(c["pos"])), None)
+            if near_cube:
+                return near_cube["pos"], False, "heal:cube", False
+            if recent:
+                cv = self.find_cover(obs, recent)
+                if cv is not None:
+                    return (cv if hdist(p, cv) > 2.5 else None), False, "heal:cover", False
+            return None, False, "heal", False
+
         if not (safe or not threats):
             # Not fully safe, but grab cubes close by (e.g. a kill's drop) if no enemy is near them.
             near = [tr for tr in threats if t - tr.seen_t < 3.0]
@@ -516,7 +548,7 @@ class Brain:
                     best, bd = pk, d
             if best:
                 return best["pos"], False, f"loot:{best['kind']}", False
-            best, bd = None, TUNING["cube_radius"]
+            best, bd = None, TUNING["cube_radius"] * (TUNING["early_farm_mult"] if t < TUNING["early_farm_s"] else 1.0)
             for c in obs["cubes"]:
                 d = hdist(p, c["pos"])
                 if d < bd and abs(c["pos"][2] - p[2]) < 6 and self.goal_ok(c["pos"]):
@@ -790,7 +822,7 @@ class Brain:
         my = math.sin(to) * radial + math.sin(to + math.pi / 2) * strafe * self.strafe
         y = math.atan2(my, mx)
         y = self.steer(p, y, me, look=6.0)
-        boost = (retreat or d < 30) and me["energy"] > TUNING["boost_min_energy"]
+        boost = ((retreat or d < 30) and me["energy"] > TUNING["boost_min_energy"]) or             me["energy"] > TUNING["fight_boost_energy"]
         return unit(y), boost
 
     def dodge(self, obs):
@@ -850,9 +882,11 @@ class Brain:
                 h, r = self.cfg["crates"].get("height", 2.4), self.cfg["crates"].get("radius", 1.4)
         else:
             aim = self.idle_aim(obs)
+            # Start every fight with a full magazine: top up whenever nobody has been seen for a moment.
+            quiet = all(t - tr.seen_t > TUNING["reload_quiet_s"] for tr in self.tracks.values())
             for i, w in enumerate(weapons):
-                if w and w["kind"] == "gun" and w.get("ammo", 99) < w["stats"].get("mag", 12) * 0.6 \
-                        and not w.get("reload"):
+                if w and w["kind"] == "gun" and not w.get("reload") and \
+                        w.get("ammo", 99) < w["stats"].get("mag", 12) * (1.0 if quiet else 0.6):
                     reload = True
             return [aim[0], aim[1]], fire, reload
 

@@ -331,6 +331,8 @@ class Sim:
             bearing = None
         victim.hp -= amount
         victim.diag["taken"] += amount
+        if rear:
+            victim.diag["rear_taken"] = victim.diag.get("rear_taken", 0.0) + amount
         if src is not None:
             victim.hits_log.append((self.t, src.id))
         if weapon == "zone":
@@ -955,13 +957,27 @@ def main():
     a = ap.parse_args()
     jobs = [(a.seed + i, a.mode, a.hero, a.opp, a.omniscient) for i in range(a.n)]
     if a.j > 1:
-        from multiprocessing import Pool
-        with Pool(a.j) as p:
-            outs = []
-            for o in p.imap_unordered(run_match, jobs):
-                print(f"done seed {o['seed']} wall={o['wall']:.0f}s", file=sys.stderr, flush=True)
-                outs.append(o)
-            outs.sort(key=lambda o: o["seed"])
+        # ProcessPoolExecutor (not multiprocessing.Pool): if a worker dies, Pool waits forever, while the
+        # executor raises BrokenProcessPool; the unfinished matches are then retried in a fresh pool.
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        from concurrent.futures.process import BrokenProcessPool
+        outs, todo = [], list(jobs)
+        for attempt in range(3):
+            if not todo:
+                break
+            done_seeds = set()
+            try:
+                with ProcessPoolExecutor(a.j) as ex:
+                    futs = {ex.submit(run_match, j): j for j in todo}
+                    for fu in as_completed(futs):
+                        o = fu.result()
+                        done_seeds.add(o["seed"])
+                        print(f"done seed {o['seed']} wall={o['wall']:.0f}s", file=sys.stderr, flush=True)
+                        outs.append(o)
+            except BrokenProcessPool:
+                print(f"a worker died; retrying {len(todo) - len(done_seeds)} matches", file=sys.stderr, flush=True)
+            todo = [j for j in todo if j[0] not in done_seeds]
+        outs.sort(key=lambda o: o["seed"])
     else:
         outs = [run_match(j) for j in jobs]
     hero_pts, opp_pts, kills = [], [], []
