@@ -1,0 +1,30 @@
+# Builds the submission image and runs the kit's conformance check exactly as the scorer does
+# (no network, 1 CPU, 512 MB, read-only root, uid 65534, map at /arena). Green = safe to submit.
+name: conformance
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Scenario tests
+        run: python tools/test_brain.py
+      - name: Latency bench (in-process)
+        run: python tools/bench.py
+      - name: Conformance (local process)
+        run: python mechfight-kit/check/check.py -- python -u bot.py
+      - name: Docker build (linux/amd64, like the scorer)
+        run: docker build --platform linux/amd64 -t my-bot .
+      - name: Conformance (match sandbox)
+        run: >
+          python mechfight-kit/check/check.py --map-dir /arena --
+          docker run --rm -i --network none --cpus 1 --memory 512m --read-only
+          --tmpfs /tmp:rw,size=64m --user 65534:65534
+          -v "$PWD/mechfight-kit/arena:/arena:ro" my-bot

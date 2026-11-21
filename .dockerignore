@@ -1,0 +1,8 @@
+# Only bot code goes in the image; the map is mounted at /arena at runtime.
+mechfight-kit/
+tools/
+scripts/
+logs/
+.git/
+**/__pycache__/
+*.md
