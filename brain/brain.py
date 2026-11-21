@@ -38,10 +38,11 @@ TUNING = {
     "loot_radius": 80.0,          # detour this far for a better weapon (when safe)
     "cube_radius": 90.0,          # detour this far for a power cube (when safe)
     "crate_radius": 120.0,        # shoot crates within this range when safe
-    "npc_farm_min_hp_frac": 0.7,  # only farm NPC drones when healthy
+    "npc_farm_min_hp_frac": 0.7,  # only farm NPC drones (they shoot back) when healthy
     "drop_max_dist": 220.0,       # consider supply drops this close
-    "drop_enemy_clear": 70.0,     # ...only if no known enemy is this close to the ring
-    "zone_inner_frac": 0.55,      # aim for this fraction of the next circle's radius
+    "drop_enemy_clear": 70.0,     # ...only if no enemy seen in the last 20 s is this close to the ring
+    "drop_min_hp_frac": 0.0,      # ...and only when this healthy
+    "zone_inner_frac": 0.55,      # aim for this fraction of the next circle's radius (deeper = safer)
     "zone_slack_s": 15.0,         # start moving for the next circle this many seconds early
     "boost_min_energy": 30.0,     # keep this much energy in reserve (for jets / escapes)
     "lightning_min_energy": 15.0,
@@ -51,6 +52,12 @@ TUNING = {
     "disengage_ratio": 0.75,      # leave a fight when my time-to-die < ratio * their time-to-die
     "cover_hp_frac": 0.45,        # below this, prefer cover to regen when anything threatens
     "reengage_hp_frac": 0.85,     # leave cover (if safe) once healed to this
+    # Caution knobs above were A/B'd at cautious values (zone 0.45/25 s, drops 120 m/0.7 HP, drones 0.9,
+    # disengage 0.9, cover 0.55/0.95, no chase, farm_quiet 10 s): 1.68 vs 2.25 pts over 110 sim matches.
+    "chase": True,                # advance on enemies beyond weapon range? (False = hold/back off)
+    "two_front": False,           # with 2+ enemies, strafe away from the second one (off: 1.88 vs 2.31 in sim A/B)
+    "finish_hp_frac": 0.3,        # ...except to finish an enemy below this HP fraction
+    "farm_quiet_s": 0.0,          # shoot crates only if no enemy was seen for this long (0 = off)
     "safe_after_s": 4.0,          # "safe" = no damage taken and no enemy seen for this long
     "track_keep_s": 20.0,         # remember enemies this long after the server stops reporting them
     "time_guard_ms": 28.0,        # skip optional heavy work past this per-tick time
@@ -356,6 +363,8 @@ class Brain:
     def pick_farm_target(self, obs: mf.Observation) -> Optional[dict]:
         me = obs["self"]
         p = me["pos"]
+        if any(obs["t"] - tr.seen_t < TUNING["farm_quiet_s"] for tr in self.tracks.values()):
+            return None  # shooting crates is loud and blocks regen: not while enemies are around
         # Early on (before the hunters arrive) cubes are worth a detour: 1 cube = +4% HP/damage and the
         # first upgrade offer (plating, +15% max HP), which decides close duels.
         early = TUNING["early_farm_mult"] if obs["t"] < TUNING["early_farm_s"] else 1.0
@@ -562,7 +571,10 @@ class Brain:
             walk = me["stats"].get("walk_speed", 11.7)
             if d > TUNING["drop_max_dist"] or dr["lands_in"] > d / walk + 10:
                 continue
-            if any(hdist(tr.pos, dr["pos"]) < TUNING["drop_enemy_clear"] for tr in threats):
+            if hp_frac < TUNING["drop_min_hp_frac"]:
+                continue
+            if any(hdist(tr.pos, dr["pos"]) < TUNING["drop_enemy_clear"] for tr in self.tracks.values()
+                   if t - tr.t < 20.0):
                 continue
             if dr.get("holder") not in (None, me["id"]) or not self.goal_ok(dr["pos"]):
                 continue
@@ -817,7 +829,18 @@ class Brain:
             radial = -1.0
         else:
             radial = max(-1.0, min(1.0, (d - want) / 25.0)) + self.radial_bias
+            finishing = enemy.hp < TUNING["finish_hp_frac"] * max(1.0, enemy.max_hp)
+            if not TUNING["chase"] and not finishing:
+                radial = min(radial, 0.0)  # cautious: let them come to us; never walk into them
         strafe = 0.9 if not retreat else 0.5
+        if TUNING["two_front"]:
+            # Another enemy nearby: strafe the way that moves us away from it, so both stay in our front
+            # 180 deg arc (hits from behind do x1.5) instead of letting it flank us.
+            others = [tr for tr in self.threats(obs) if tr.id != enemy.id and t - tr.seen_t < 3.0]
+            if others:
+                o2 = min(others, key=lambda tr: hdist(p, tr.pos))
+                side = math.cos(to + math.pi / 2) * (o2.pos[0] - p[0]) + math.sin(to + math.pi / 2) * (o2.pos[1] - p[1])
+                self.strafe = -1.0 if side > 0 else 1.0
         mx = math.cos(to) * radial + math.cos(to + math.pi / 2) * strafe * self.strafe
         my = math.sin(to) * radial + math.sin(to + math.pi / 2) * strafe * self.strafe
         y = math.atan2(my, mx)
