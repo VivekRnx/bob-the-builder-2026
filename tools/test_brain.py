@@ -81,6 +81,7 @@ def test_laser_charges_then_releases():
 
 def test_mortar_lobs():
     b, o = fresh()
+    b.T["no_first_shot"] = False  # 120 m without a laser: we'd hold fire otherwise
     enemy_at(o, 120, 0)
     o["self"]["weapons"][1] = weapon("mortar")
     a = b.act(o)
@@ -126,6 +127,7 @@ def test_turns_to_unseen_attacker():
 
 def test_sticks_to_target():
     b, o = fresh()
+    b.T["no_first_shot"] = False
     enemy_at(o, 60, 0)
     o["mechs"].append(dict(o["mechs"][0], id=10, pos=[o["self"]["pos"][0], o["self"]["pos"][1] + 62,
                                                       o["self"]["pos"][2]]))
@@ -161,6 +163,79 @@ def test_climbs_out_of_courtyard():
     o["self"]["energy"] = 100
     a = b.act(o)
     assert "climb" in b.mode and a["jump"] and a["boost"] and a["move"] != [0, 0], (b.mode, a)
+
+
+def test_no_first_shot_without_laser():
+    b, o = fresh()
+    b.T["no_first_shot"] = True  # on in free-for-all mode
+    enemy_at(o, 100, 0)  # far, not attacking us, and we have no laser: don't start it
+    b.perceive(o)
+    assert b.pick_enemy(o) is None
+    enemy_at(o, 40, 0, weapons=["gun", "laser"])  # a laser carrier: don't start it either
+    b.perceive(o)
+    assert b.pick_enemy(o) is None
+    enemy_at(o, 40, 0)  # close gun-only mech: fair fight
+    b.perceive(o)
+    assert b.pick_enemy(o) is not None
+    o["self"]["weapons"][1] = weapon("laser", charge=0)
+    enemy_at(o, 100, 0, weapons=["gun", "laser"])  # with a laser we take it on
+    b.perceive(o)
+    assert b.pick_enemy(o) is not None
+
+
+def test_lethal_laser_releases_early():
+    b, o = fresh()
+    enemy_at(o, 60, 0, hp=120)
+    o["self"]["weapons"][1] = weapon("laser", charge=0)
+    a = b.act(o)
+    face(o, a)
+    o["self"]["weapons"][1]["charge"] = 0.3  # partial charge already kills a 120 HP mech
+    a = b.act(o)
+    assert a["fire"][1] is False, "should release the partial charge"
+    o["mechs"][0]["hp"] = 1400
+    a = b.act(o)
+    assert a["fire"][1] is True, "keep charging against a healthy target"
+
+
+def test_never_picks_up_mortar():
+    b, o = fresh()
+    p = o["self"]["pos"]
+    o["pickups"] = [{"id": 8002, "kind": "mortar", "pos": [p[0] + 1, p[1], p[2]]}]
+    assert b.act(o).get("take") is None
+
+
+def test_detects_free_for_all():
+    b, o = fresh()
+    o["mechs"] = []
+    o["alive"] = 16
+    b.act(o)
+    assert not b.ffa
+    o["alive"] = 14  # two mechs died and we killed nobody
+    for _ in range(6):
+        b.act(o)
+    assert b.ffa and b.T["quiet_walk"]
+
+
+def test_practice_kills_are_not_ffa():
+    b, o = fresh()
+    o["mechs"] = []
+    o["alive"] = 16
+    b.act(o)
+    o["alive"] = 15
+    o["events"] = [{"type": "kill", "target": 4}]
+    b.act(o)
+    o["events"] = []
+    for _ in range(6):
+        b.act(o)
+    assert not b.ffa
+
+
+def test_cube_cap():
+    b, o = fresh()
+    me = o["self"]
+    for n, want in ((0, True), (9, True), (10, False), (12, False), (13, True), (14, True), (15, False)):
+        me["cubes"] = n
+        assert b.wants_cube(me) == want, n
 
 
 if __name__ == "__main__":

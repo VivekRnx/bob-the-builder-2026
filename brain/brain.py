@@ -71,7 +71,36 @@ TUNING = {
     "tgt_charging_bonus": 40.0,   # ... for an enemy charging a laser at us
     "tgt_sticky": 40.0,           # keep the current target unless another scores this much better
     "aim_tol_mult": 1.0,          # gun fires when aim error < this * target's angular size
+    # ---- ideas from the top public bots (giddygiddyboy's Go bot, Team 67's automata; both MIT) ----
+    "laser_seek_radius": 240.0,   # without a laser, detour this far for one when nobody threatens us
+    "laser_seek_hot_radius": 70.0,  # ...and this far while threatened / fighting
+    "no_first_shot": False,       # (FFA only: hurt vs the practice squad in sim, 2.07 vs 1.82) without a laser, don't open on a laser carrier or anything far ...
+    "nofirst_range": 55.0,        # ... (beyond this) unless it is hunting us
+    "lethal_laser_k": 0.7,        # release a partial laser charge once k * its damage >= target HP (0 = off)
+    "retreat_multi_hp": 0.65,     # take cover below this HP fraction with 2+ attackers
+    "retreat_press_hp": 0.75,     # ...or when pressured (2+ attackers, or a laser within 130 m while hit)
+    "finish_ratio": 0.6,          # stay in a 1v1 to finish a target below this fraction of our HP
+    "cube_cap": True,             # seek cubes only below stat_cap (10), or 13-14 to reach the 15 upgrade
+    "killsite_s": 40.0,           # walk to where we killed someone within this many seconds ...
+    "killsite_r": 150.0,          # ... and this close, to collect the dropped cubes (when calm)
+    "crate_stop_s": 1e9,          # stop shooting crates after this match time
+    "quiet_walk": False,          # travel below the footstep-sound speed when not in a hurry
+    # FFA play: engage only when forced (close, attacking us, charging at us, weak, or last two)
+    "ffa_engage_only_forced": False,
+    "ffa_detect_ticks": 5,        # unexplained deaths seen this many ticks in a row -> it's a free-for-all
+    "ffa_min_deaths": 2,          # ...at least this many of them
     "debug": True,
+}
+
+# Practice is 15 house bots acting as one squad: they never kill each other. If mechs die that we
+# didn't kill, this is a free-for-all (the final): switch to quieter, survival-first play.
+FFA_OVERRIDES = {
+    "quiet_walk": True,
+    "no_first_shot": True,
+    "ffa_engage_only_forced": True,
+    "chase": False,
+    "crate_stop_s": 150.0,
+    "zone_inner_frac": 0.7,
 }
 
 # Tuned values promoted by tools/evolve.py (champion), merged over the defaults above.
@@ -172,6 +201,14 @@ class Brain:
         self.goal_key: Optional[Tuple[int, int]] = None
         self.goal_best_d = 1e9
         self.goal_best_t = 0.0
+        # free-for-all detection and the ideas ported from the top bots
+        self.ffa = False
+        self.start_alive: Optional[int] = None
+        self.alive = 16
+        self.my_kills = 0
+        self.unexplained_ticks = 0
+        self.attacked_by: Dict[int, float] = {}  # mech id -> last time it damaged us
+        self.kill_sites: List[Tuple[float, float, float]] = []  # (x, y, t)
 
     # ================================================================== main
     def act(self, obs: mf.Observation) -> mf.Action:
@@ -207,6 +244,13 @@ class Brain:
             self.mode = mode = mode + "+dodge"
         if not me["grounded"] and t >= self.unstick_until and not mode.startswith("zone!") and not self.climbing:
             boost = False  # boost in the air = jets: only on purpose
+        # Quiet travel: under sound.step_speed nobody hears our steps (13 of 16 bots in real FFA replays do this).
+        if self.T["quiet_walk"] and not boost and not urgent and t >= self.unstick_until and \
+                mode.split(":")[0].split("+")[0] in ("loot", "cube", "drop", "drift", "zone", "farm", "hold"):
+            q = 0.92 * self.cfg.get("sound", {}).get("step_speed", 5.0) / max(1.0, me["stats"].get("walk_speed", 11.7))
+            n = math.hypot(move[0], move[1])
+            if n > q:
+                move = [round(move[0] * q / n, 3), round(move[1] * q / n, 3)]
         aim, fire, reload = self.combat(obs, enemy, farm)
         if mode.startswith("cover") and enemy is not None and not self.has_los_to(me, enemy):
             fire = [False, False]  # don't give away the hide; let regen start
@@ -282,6 +326,7 @@ class Brain:
                     by = int(ev["by"])
                     self.threat = (ev["bearing"], t, by)
                     if by < 100:  # a mech, not an NPC drone
+                        self.attacked_by[by] = t
                         tr = self.tracks.get(by)
                         if tr is None or t - tr.seen_t > 0.5:
                             # unseen attacker: guess its position along the bearing
@@ -302,8 +347,26 @@ class Brain:
             elif et == "take_failed":
                 self.bad_pickups[int(ev["id"])] = t
             elif et == "kill":
-                self.tracks.pop(int(ev["target"]), None)
+                dead = self.tracks.pop(int(ev["target"]), None)
+                self.my_kills += 1
+                if dead is not None:
+                    self.kill_sites.append((dead.pos[0], dead.pos[1], t))
                 mf.log(f"t={t:.1f} killed {ev['target']}")
+        # free-for-all detection: deaths we didn't cause (house bots never kill each other)
+        self.alive = int(obs.get("alive", self.alive))
+        if self.start_alive is None:
+            self.start_alive = self.alive
+        # (one stray death can be a house bot lost to the zone or a drone; two means mechs fight each other)
+        if self.start_alive - self.alive - self.my_kills >= self.T["ffa_min_deaths"]:
+            self.unexplained_ticks += 1
+        else:
+            self.unexplained_ticks = 0
+        if not self.ffa and self.unexplained_ticks >= self.T["ffa_detect_ticks"]:
+            self.ffa = True
+            self.T.update(FFA_OVERRIDES)
+            self.T.update(self.params.get("ffa", {}) if isinstance(self.params.get("ffa"), dict) else {})
+            mf.log(f"t={t:.1f} free-for-all detected: switching to survival play")
+        self.kill_sites = [k for k in self.kill_sites if t - k[2] < self.T["killsite_s"]]
         # sounds that matter (weapons/steps), kept 2 s
         for s in obs.get("sounds", []):
             if s["kind"] in ("gun", "laser", "laser_charge", "mortar", "lightning", "step", "boost", "jet") \
@@ -355,9 +418,21 @@ class Brain:
         me = obs["self"]
         best, best_score = None, 1e9
         cur_score = None
+        t = obs["t"]
+        have_laser = any(w and w["kind"] == "laser" for w in me["weapons"])
         for m in self.visible_enemies(obs):
             tr = self.tracks[m["id"]]
             d = math.dist(m["pos"], me["pos"])
+            hunting = t - self.attacked_by.get(tr.id, -99.0) < 4.0 or (tr.charging and self.aimed_at_me(tr, me))
+            if tr.id != self.target_id and not hunting:
+                # don't start fights we're likely to lose (automata's sf_nofirst)
+                if self.T["no_first_shot"] and not have_laser and \
+                        ("laser" in tr.weapons or d > self.T["nofirst_range"]):
+                    continue
+                # free-for-all: fight only when forced (giddy's ghost mode)
+                if self.T["ffa_engage_only_forced"] and not (
+                        d < 60 or (tr.hp < 350 and d < 120) or self.alive <= 2):
+                    continue
             hp_frac = tr.hp / max(1.0, tr.max_hp)
             score = d + self.T["tgt_hp_w"] * hp_frac
             if self.threat and self.threat[2] == tr.id and obs["t"] - self.threat[1] < 4:
@@ -388,7 +463,7 @@ class Brain:
         # first upgrade offer (plating, +15% max HP), which decides close duels.
         early = self.T["early_farm_mult"] if obs["t"] < self.T["early_farm_s"] else 1.0
         best, bd = None, self.T["crate_radius"] * early
-        for c in obs["crates"]:
+        for c in (obs["crates"] if obs["t"] < self.T["crate_stop_s"] else []):
             d = hdist(p, c["pos"])
             if d < bd and abs(c["pos"][2] - p[2]) < 20 and self.goal_ok(c["pos"]):
                 best, bd = dict(c, kind="crate", vel=[0, 0, 0]), d
@@ -412,6 +487,32 @@ class Brain:
         prio = self.T["upgrade_priority"]
         ranks = [prio.index(c["id"]) if c["id"] in prio else 99 for c in offer["choices"]]
         return ranks.index(min(ranks))
+
+    def wants_cube(self, me: dict) -> bool:
+        if not self.T["cube_cap"]:
+            return True
+        n = me.get("cubes", 0)
+        cap = self.cfg["cubes"].get("stat_cap", 10)
+        return n < cap or 13 <= n < 15
+
+    def laser_pickup(self, obs, radius: float) -> Optional[dict]:
+        """Nearest reachable laser pickup within radius, if we don't hold a laser yet."""
+        me, t = obs["self"], obs["t"]
+        if radius <= 0 or any(w and w["kind"] == "laser" for w in me["weapons"]):
+            return None
+        p = me["pos"]
+        best, bd = None, radius
+        for pk in obs["pickups"]:
+            if pk["kind"] != "laser" or not self.goal_ok(pk["pos"]) or abs(pk["pos"][2] - p[2]) > 6:
+                continue
+            if int(pk["id"]) in self.bad_pickups and t - self.bad_pickups[int(pk["id"])] < 5:
+                continue
+            if not self.in_next_circle(obs, pk["pos"]) and not me["in_zone"]:
+                continue
+            d = hdist(p, pk["pos"])
+            if d < bd:
+                best, bd = pk, d
+        return best
 
     def held(self, me: dict) -> List[Optional[str]]:
         return [w["kind"] if w else None for w in me["weapons"]]
@@ -519,6 +620,17 @@ class Brain:
             want_cover = True
         if self.in_cover_mode and hp_frac < self.T["reengage_hp_frac"] and (threats or recently_hit):
             want_cover = True
+        # pressure-based retreat (automata): outnumbered, or under laser fire
+        n_att = sum(1 for k, ts in self.attacked_by.items() if t - ts < 4.0)
+        laser_near = any("laser" in tr.weapons and hdist(tr.pos, p) < 130 and t - tr.seen_t < 1.0
+                         for tr in threats)
+        pressured = n_att >= 2 or (laser_near and t - self.last_hit_taken < 4.0)
+        if (n_att >= 2 and hp_frac < self.T["retreat_multi_hp"]) or (pressured and hp_frac < self.T["retreat_press_hp"]):
+            want_cover = True
+        # ...but stay in a 1v1 to finish a clearly weaker target
+        if want_cover and enemy is not None and n_att <= 1 and t - enemy.seen_t < 0.5 and \
+                enemy.hp < self.T["finish_ratio"] * me["hp"] and len([tr for tr in threats if t - tr.seen_t < 3.0]) <= 1:
+            want_cover = False
         if want_cover and threats:
             cv = self.find_cover(obs, threats)
             if cv is not None:
@@ -530,6 +642,12 @@ class Brain:
             if enemy is not None:
                 return None, False, "retreat", True
         self.in_cover_mode = False
+
+        # Laser first: every top bot detours far for one (70 m when hot, 240 m when calm).
+        lz = self.laser_pickup(obs, self.T["laser_seek_hot_radius"] if (threats or recently_hit or enemy)
+                               else self.T["laser_seek_radius"])
+        if lz is not None:
+            return lz["pos"], False, "loot:laser", enemy is not None and hdist(p, lz["pos"]) < 4.0
 
         if enemy is not None:
             return None, False, "fight", True
@@ -556,7 +674,7 @@ class Brain:
             # Not fully safe, but grab cubes close by (e.g. a kill's drop) if no enemy is near them.
             near = [tr for tr in threats if t - tr.seen_t < 3.0]
             best, bd = None, 40.0
-            for c in obs["cubes"]:
+            for c in (obs["cubes"] if self.wants_cube(me) else []):
                 d = hdist(p, c["pos"])
                 if d < bd and abs(c["pos"][2] - p[2]) < 6 and self.goal_ok(c["pos"]) and \
                         all(hdist(tr.pos, c["pos"]) > 60 for tr in near):
@@ -577,12 +695,21 @@ class Brain:
             if best:
                 return best["pos"], False, f"loot:{best['kind']}", False
             best, bd = None, self.T["cube_radius"] * (self.T["early_farm_mult"] if t < self.T["early_farm_s"] else 1.0)
-            for c in obs["cubes"]:
+            for c in (obs["cubes"] if self.wants_cube(me) else []):
                 d = hdist(p, c["pos"])
                 if d < bd and abs(c["pos"][2] - p[2]) < 6 and self.goal_ok(c["pos"]):
                     best, bd = c, d
             if best:
                 return best["pos"], False, "cube", False
+            # a recent kill's dropped cubes we can't see from here
+            if self.wants_cube(me):
+                for k in sorted(self.kill_sites, key=lambda k: hdist(p, k)):
+                    d = hdist(p, k)
+                    if d < 8.0:
+                        self.kill_sites.remove(k)
+                        break
+                    if d < self.T["killsite_r"] and self.goal_ok(k):
+                        return [k[0], k[1]], False, "cube:site", False
 
         # supply drop: 3 cubes + full heal for standing alone in the ring
         for dr in obs.get("drops", []):
@@ -996,6 +1123,19 @@ class Brain:
                 if in_range and w["cooldown"] <= 0:
                     full = charge >= ws["charge"] - 0.05
                     fire[i] = not (full and on_target)
+                    # lethal partial charge: release early when this beam already kills
+                    k_l = self.T["lethal_laser_k"]
+                    if k_l > 0 and kind == "mech" and enemy is not None and on_target and \
+                            charge >= ws.get("min_charge", 0.15):
+                        mf_ = ws.get("min_frac", 0.35)
+                        frac = mf_ + (1 - mf_) * min(1.0, charge / max(0.01, ws["charge"]))
+                        cubes = self.cfg["cubes"]
+                        dmg = ws["damage"] * frac * (1 + cubes.get("damage_per_cube", 0.04) *
+                                                     min(me["cubes"], cubes.get("stat_cap", 10)))
+                        if "mortar" in enemy.weapons:
+                            dmg *= 1 + ws.get("cookoff", 0.6)
+                        if dmg * k_l >= enemy.hp:
+                            fire[i] = False
                 else:
                     fire[i] = False  # release (fires if charged) / idle
             elif k == "lightning":

@@ -42,8 +42,8 @@
   "aim_tol_mult": 1.203478280601682,
   "weapon_rank": {
    "laser": 3,
-   "mortar": 2,
-   "lightning": 1,
+   "lightning": 2,
+   "mortar": -1,
    "gun": 0
   },
   "upgrade_priority": [
