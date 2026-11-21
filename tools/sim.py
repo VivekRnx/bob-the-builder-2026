@@ -961,7 +961,9 @@ class Sim:
         self.hunters = {m.id for m in squad[:k]}
 
     # ------------------------------------------------------------------ loop
-    def run(self, max_t=None, verbose=False):
+    def run(self, max_t=None, verbose=False, stop_when=None):
+        """Play the match. `stop_when(sim)` ends it early once the result we care about is decided
+        (e.g. every evaluated mech is dead: its place was fixed at death, the rest is wasted time)."""
         max_t = max_t or self.cfg["match"]["duration_s"]
         for m in self.mechs:
             h = copy.deepcopy(self.hello)
@@ -970,6 +972,8 @@ class Sim:
             mf.draw.caps = h["config"]["debug"]
             m.bot = m.bot(h)
         while self.t < max_t and sum(m.alive for m in self.mechs) > 1:
+            if stop_when is not None and stop_when(self):
+                break
             vis = {}
             alive = [m for m in self.mechs if m.alive]
             self.update_hunters(alive)

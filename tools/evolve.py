@@ -189,7 +189,8 @@ def play(job: dict) -> dict:
         tracked = {i for i in range(len(slots)) if slots[idx[i]].get("track")}
     S = sim.Sim(_HELLO, bots, teams, job["seed"])
     S.tier = mt
-    res = S.run()
+    early = job.get("early_stop", EARLY_STOP)
+    res = S.run(stop_when=(lambda Sm: not any(Sm.mechs[i].alive for i in tracked)) if early else None)
     out: Dict[str, List[float]] = {}
     kills: Dict[str, List[int]] = {}
     ms: Dict[str, float] = {}
@@ -357,8 +358,16 @@ class Evo:
         return 0.5 * sq_m + 0.5 * ff_m, len(sq) + len(ff), sq_m, ff_m
 
     # -------------------------------------------------- one generation
+    def gen_minutes(self) -> float:
+        """Recent generation duration (max of the last 3), for deadline planning."""
+        starts = self.st.get("gen_start", {})
+        ends = {str(h["gen"]): h.get("end", h["time"]) for h in self.st["history"]}
+        durs = [(ends[g] - starts[g]) / 60 for g in starts if g in ends]
+        return max(durs[-3:]) if durs else 25.0
+
     def generation(self) -> None:
         gen = self.st["gen"]
+        self.st.setdefault("gen_start", {}).setdefault(str(gen), time.time())
         rng = random.Random(1000 + gen)
         pop: List[str] = self.st["population"]
         if self.st["phase"] == "breed" or len(pop) < self.P:
@@ -413,6 +422,8 @@ class Evo:
             if cand and self.fitness(cand)[0] > self.fitness(self.st["champion"])[0] + CHALLENGE_MARGIN:
                 self.challenge(cand)
             self.st["phase"] = "breed"
+            if self.st["history"] and self.st["history"][-1]["gen"] == gen:
+                self.st["history"][-1]["end"] = time.time()
             self.st["gen"] = gen + 1
             self.st["population"] = list(self.st["elites"])
             self.save()
@@ -482,14 +493,18 @@ class Evo:
             msgs = [json.loads(l) for l in f if l.strip()]
         cls = _bot_class("brain", to_params(self.G(h)), h)
         mf.draw.caps = hello["config"]["debug"]
-        bot = cls(hello)
-        worst = 0.0
-        for m in msgs[1:]:
-            if m.get("type") == "obs":
-                mf.draw.clear()
-                s = time.perf_counter()
-                bot.act(m)
-                worst = max(worst, (time.perf_counter() - s) * 1000)
+        runs = []
+        for _ in range(2):  # best of two: a busy machine inflates one pass, a slow bot is slow every time
+            bot = cls(hello)
+            worst = 0.0
+            for m in msgs[1:]:
+                if m.get("type") == "obs":
+                    mf.draw.clear()
+                    s = time.perf_counter()
+                    bot.act(m)
+                    worst = max(worst, (time.perf_counter() - s) * 1000)
+            runs.append(worst)
+        worst = min(runs)
         return worst < LATENCY_MAX_MS, worst
 
     def challenge(self, cand: str) -> None:
@@ -520,7 +535,7 @@ class Evo:
     def final_test(self) -> None:
         a, b = self.st["champion"], self.st["reference"]
         if a == b:
-            print("champion == reference; nothing to test")
+            self.log("final test skipped: no promotion happened (champion is still the starting bot)")
             return
         diff, se, det = self.paired(a, b, TEST_BASE, TEST_SQUAD, TEST_FFA, "final-test")
         msg = (f"FINAL TEST (untouched seeds) champion {a} vs reference {b}: {diff:+.3f} pts "
@@ -530,6 +545,51 @@ class Evo:
             json.dump({"champion": a, "reference": b, "diff": diff, "se": se, **det}, f, indent=1)
 
 
+    def report(self) -> str:
+        """Markdown summary: learning curve, promotions, final test, champion's changed settings."""
+        st = self.st
+        L = [f"# Evolution report: {os.path.basename(self.dir)}", "",
+             f"- generated {time.strftime('%Y-%m-%d %H:%M')}; generations completed: {st['gen']}; "
+             f"matches simulated: {len(self.results)}; worker deaths: {st.get('worker_deaths', 0)}; "
+             f"skipped matches: {len(st.get('skipped', []))}",
+             f"- reference (starting bot): `{st['reference']}`; champion: `{st['champion']}`",
+             "- fitness = 0.5 x mean practice-style squad points + 0.5 x mean free-for-all points (simulator)", "",
+             "## Learning curve (training seeds, shrunk means)", "",
+             "| gen | best | best fitness | squad | ffa | n | population mean | champion fitness |",
+             "| --- | --- | --- | --- | --- | --- | --- | --- |"]
+        for h in st["history"]:
+            L.append(f"| {h['gen']} | `{h['best']}` | {h['best_fit']:.3f} | {h['best_sq']:.2f} | {h['best_ffa']:.2f} | "
+                     f"{h['best_n']} | {h['pop_mean']:.3f} | {h['champ_fit']:.3f} |")
+        L += ["", "## Validation challenges (paired by seed; promote if z > %.1f)" % self.promote_z, "",
+              "| gen | challenger | vs champion | diff (pts) | se | z | squad diff | ffa diff | latency ms | result |",
+              "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
+        rows = [(r, "PROMOTED") for r in st["promotions"]] + [(r, "kept") for r in st.get("rejections", [])]
+        for r, res in sorted(rows, key=lambda x: x[0]["time"]):
+            L.append(f"| {r['gen']} | `{r['cand']}` | `{r['champ']}` | {r['diff']:+.3f} | {r['se']:.3f} | {r['z']:.2f} | "
+                     f"{r['squad_diff']:+.2f} | {r['ffa_diff']:+.2f} | {r['latency_ms']:.1f} | {res} |")
+        ft = os.path.join(self.dir, "final_test.json")
+        L += ["", "## Final test (untouched seeds, run once)", ""]
+        if os.path.exists(ft):
+            d = json.load(open(ft))
+            L.append(f"Champion vs starting bot: **{d['diff']:+.3f} pts** (95% CI {d['diff'] - 1.96 * d['se']:+.3f} .. "
+                     f"{d['diff'] + 1.96 * d['se']:+.3f}); squad {d['squad_diff']:+.2f} +/- {d['squad_se']:.2f} "
+                     f"over {d['n_sq']} seeds, free-for-all {d['ffa_diff']:+.2f} +/- {d['ffa_se']:.2f} over {d['n_ffa']} matches.")
+        else:
+            L.append("Not run (no promotion, or the run stopped early).")
+        a, b = self.G(st["champion"]), self.G(st["reference"])
+        L += ["", "## Champion's settings that differ from the starting bot", ""]
+        diffs = [f"- `{k}`: {b[k]} -> {a[k]}" for k in a if a[k] != b[k]]
+        L += diffs or ["(none)"]
+        L += ["", "## Caveats", "",
+              "- Opponents are simulated stand-ins (earlier versions of this bot), not the real house bots.",
+              "- Matches are not bit-reproducible: the bot has wall-clock time guards, so CPU load adds noise.",
+              "- Gains here are candidates for real practice; only the practice score confirms transfer."]
+        text = "\n".join(L) + "\n"
+        with open(os.path.join(self.dir, "report.md"), "w", encoding="utf-8") as f:
+            f.write(text)
+        return text
+
+
 # seed sets (disjoint)
 TRAIN_BASE, VALID_BASE, TEST_BASE = 100_000, 5_000_000, 9_000_000
 SCREEN_SQUAD, SCREEN_FFA_ROUNDS = 12, 2
@@ -537,7 +597,8 @@ RACE_SQUAD, RACE_FFA_ROUNDS = 24, 3
 VALID_SQUAD, VALID_FFA = 120, 30
 TEST_SQUAD, TEST_FFA = 200, 50
 PRIOR_SQ, PRIOR_FFA = 2.0, 7.5
-LATENCY_MAX_MS = 15.0
+LATENCY_MAX_MS = 25.0  # local max act() on the recorded stream; the real limit is 50 ms on 1 CPU
+EARLY_STOP = True  # end a match once every evaluated mech is dead (placement is fixed at death)
 CHALLENGE_MARGIN = 0.05  # challenge only when the best elite's training fitness beats the champion's by this
 
 
@@ -552,6 +613,8 @@ def main():
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--final-test", action="store_true")
     ap.add_argument("--smoke", action="store_true", help="pipeline check: tiny seed counts, forced promotion")
+    ap.add_argument("--deadline", default=None, help='finish everything (incl. final test + report) by "YYYY-MM-DD HH:MM" local time')
+    ap.add_argument("--reserve-min", type=float, default=30.0, help="minutes kept for the final test + report")
     a = ap.parse_args()
     if a.smoke:
         global SCREEN_SQUAD, SCREEN_FFA_ROUNDS, RACE_SQUAD, RACE_FFA_ROUNDS, VALID_SQUAD, VALID_FFA, CHALLENGE_MARGIN
@@ -569,8 +632,19 @@ def main():
     if a.final_test:
         evo.final_test()
         return
+    deadline = time.mktime(time.strptime(a.deadline, "%Y-%m-%d %H:%M")) if a.deadline else None
     for _ in range(a.generations):
+        if deadline is not None:
+            left = (deadline - time.time()) / 60 - a.reserve_min
+            need = evo.gen_minutes() * 1.15
+            if evo.st["phase"] == "breed" and left < need:
+                evo.log(f"deadline: {left:.0f} min left before the reserve, a generation takes ~{need:.0f} min -> stopping")
+                break
+            evo.status(deadline=a.deadline, minutes_left=round(left + a.reserve_min, 1))
         evo.generation()
+    evo.final_test()
+    evo.log("report written:\n" + evo.report())
+    evo.status(finished=True)
 
 
 if __name__ == "__main__":
