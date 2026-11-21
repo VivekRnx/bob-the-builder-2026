@@ -66,8 +66,24 @@ TUNING = {
     "early_farm_mult": 1.7,       # ...crates/cubes this much further away are worth a detour
     "reload_quiet_s": 2.0,        # reload a non-full magazine once no enemy has been seen this long
     "fight_boost_energy": 999.0,  # boost while strafing in a fight above this energy (999 = never)
+    "tgt_hp_w": 90.0,             # target score: + this * enemy HP fraction (prefer weak targets)
+    "tgt_attacker_bonus": 70.0,   # target score bonus for whoever is shooting us
+    "tgt_charging_bonus": 40.0,   # ... for an enemy charging a laser at us
+    "tgt_sticky": 40.0,           # keep the current target unless another scores this much better
+    "aim_tol_mult": 1.0,          # gun fires when aim error < this * target's angular size
     "debug": True,
 }
+
+# Tuned values promoted by tools/evolve.py (champion), merged over the defaults above.
+try:
+    import json as _json0
+    import os as _os0
+    _cp = _os0.path.join(_os0.path.dirname(_os0.path.abspath(__file__)), "champion.json")
+    if _os0.path.exists(_cp):
+        with open(_cp) as _f:
+            TUNING.update(_json0.load(_f).get("params", {}))
+except Exception:  # a bad file must never break the bot
+    pass
 
 # Local experiments only: MECH_TUNING='{"fight_boost_energy": 50}' overrides knobs (never set in a match).
 try:
@@ -103,8 +119,11 @@ class Track:
 
 class Brain:
     name = "osu-mech"
+    params: Dict[str, Any] = {}  # per-class overrides of TUNING (evolution makes subclasses with these)
 
     def __init__(self, hello: mf.Hello):
+        self.T = dict(TUNING)
+        self.T.update(self.params)
         self.cfg = hello["config"]
         self.me_id = int(hello["slot"])
         self.rng = random.Random(hello["seed"])
@@ -174,7 +193,7 @@ class Brain:
             self.target_id = None
         safe = self.is_safe(obs)
         # Regen needs regen_delay s without dealing OR taking damage: when hurt, don't shoot crates/drones.
-        healing = me["hp"] < TUNING["heal_below_frac"] * me["max_hp"] and enemy is None
+        healing = me["hp"] < self.T["heal_below_frac"] * me["max_hp"] and enemy is None
         farm = self.pick_farm_target(obs) if (enemy is None and safe and not healing) else None
         act.update(self.loot_action(obs))
 
@@ -196,7 +215,7 @@ class Brain:
         if reload:
             act["reload"] = True
 
-        if TUNING["debug"]:
+        if self.T["debug"]:
             p = me["pos"]
             if goal:
                 mf.draw.point([goal[0], goal[1], p[2] + 1], "#40c0ff", 6)
@@ -236,7 +255,7 @@ class Brain:
             self.goal_key = None
 
     def time_ok(self) -> bool:
-        return (time.perf_counter() - self.tick_start) * 1000 < TUNING["time_guard_ms"]
+        return (time.perf_counter() - self.tick_start) * 1000 < self.T["time_guard_ms"]
 
     # ================================================================== perception
     def perceive(self, obs: mf.Observation) -> None:
@@ -292,7 +311,7 @@ class Brain:
                 self.sound_contacts.append((s["bearing"], t - s.get("age", 0), s["dist"]))
         self.sound_contacts = [c for c in self.sound_contacts if t - c[1] < 2.0][-12:]
         # forget stale tracks
-        for k in [k for k, tr in self.tracks.items() if t - tr.t > TUNING["track_keep_s"]]:
+        for k in [k for k, tr in self.tracks.items() if t - tr.t > self.T["track_keep_s"]]:
             del self.tracks[k]
         # stuck detection: we asked to move but are barely moving on the ground
         speed = math.hypot(me["vel"][0], me["vel"][1])
@@ -319,10 +338,10 @@ class Brain:
 
     def is_safe(self, obs) -> bool:
         t = obs["t"]
-        if t - self.last_hit_taken < TUNING["safe_after_s"]:
+        if t - self.last_hit_taken < self.T["safe_after_s"]:
             return False
         for tr in self.tracks.values():
-            if t - tr.seen_t < TUNING["safe_after_s"] and hdist(tr.pos, obs["self"]["pos"]) < 200:
+            if t - tr.seen_t < self.T["safe_after_s"] and hdist(tr.pos, obs["self"]["pos"]) < 200:
                 return False
         return True
 
@@ -340,18 +359,18 @@ class Brain:
             tr = self.tracks[m["id"]]
             d = math.dist(m["pos"], me["pos"])
             hp_frac = tr.hp / max(1.0, tr.max_hp)
-            score = d + 90 * hp_frac
+            score = d + self.T["tgt_hp_w"] * hp_frac
             if self.threat and self.threat[2] == tr.id and obs["t"] - self.threat[1] < 4:
-                score -= 70  # whoever is shooting us
+                score -= self.T["tgt_attacker_bonus"]  # whoever is shooting us
             if tr.charging and self.aimed_at_me(tr, me):
-                score -= 40
+                score -= self.T["tgt_charging_bonus"]
             if d > 240:
                 score += 200
             if tr.id == self.target_id:
                 cur_score = score
             if score < best_score:
                 best, best_score = tr, score
-        if cur_score is not None and cur_score < best_score + 40:
+        if cur_score is not None and cur_score < best_score + self.T["tgt_sticky"]:
             best = self.tracks[self.target_id]  # stick with the current target unless clearly worse
         self.target_id = best.id if best else None
         return best
@@ -363,17 +382,17 @@ class Brain:
     def pick_farm_target(self, obs: mf.Observation) -> Optional[dict]:
         me = obs["self"]
         p = me["pos"]
-        if any(obs["t"] - tr.seen_t < TUNING["farm_quiet_s"] for tr in self.tracks.values()):
+        if any(obs["t"] - tr.seen_t < self.T["farm_quiet_s"] for tr in self.tracks.values()):
             return None  # shooting crates is loud and blocks regen: not while enemies are around
         # Early on (before the hunters arrive) cubes are worth a detour: 1 cube = +4% HP/damage and the
         # first upgrade offer (plating, +15% max HP), which decides close duels.
-        early = TUNING["early_farm_mult"] if obs["t"] < TUNING["early_farm_s"] else 1.0
-        best, bd = None, TUNING["crate_radius"] * early
+        early = self.T["early_farm_mult"] if obs["t"] < self.T["early_farm_s"] else 1.0
+        best, bd = None, self.T["crate_radius"] * early
         for c in obs["crates"]:
             d = hdist(p, c["pos"])
             if d < bd and abs(c["pos"][2] - p[2]) < 20 and self.goal_ok(c["pos"]):
                 best, bd = dict(c, kind="crate", vel=[0, 0, 0]), d
-        if me["hp"] / me["max_hp"] >= TUNING["npc_farm_min_hp_frac"]:
+        if me["hp"] / me["max_hp"] >= self.T["npc_farm_min_hp_frac"]:
             for n in obs["mechs"]:
                 if n["kind"] == "npc":
                     d = hdist(p, n["pos"])
@@ -390,7 +409,7 @@ class Brain:
 
     # ================================================================== loot & upgrades
     def choose_upgrade(self, offer: dict) -> int:
-        prio = TUNING["upgrade_priority"]
+        prio = self.T["upgrade_priority"]
         ranks = [prio.index(c["id"]) if c["id"] in prio else 99 for c in offer["choices"]]
         return ranks.index(min(ranks))
 
@@ -399,7 +418,7 @@ class Brain:
 
     def pickup_value(self, me: dict, kind: str) -> Tuple[float, Optional[int]]:
         """(gain, slot to drop or None). gain <= 0 means not worth it."""
-        rank = TUNING["weapon_rank"]
+        rank = self.T["weapon_rank"]
         held = self.held(me)
         if kind in held:
             return 0, None
@@ -449,7 +468,7 @@ class Brain:
         armor = 1 - me["stats"].get("armor", 0)
         t_me = me["hp"] / (incoming * armor)
         t_them = enemy.hp / max(1.0, self.my_dps(me))
-        return t_me < TUNING["disengage_ratio"] * t_them
+        return t_me < self.T["disengage_ratio"] * t_them
 
     # ================================================================== goals
     def zone_status(self, obs: mf.Observation) -> Tuple[Optional[List[float]], bool]:
@@ -459,11 +478,11 @@ class Brain:
         walk = me["stats"].get("walk_speed", 11.7) * 0.8  # paths aren't straight
         nc, nr = z["next_center"], z["next_radius"]
         d_next = hdist(p, nc)
-        inner = nr * TUNING["zone_inner_frac"]
+        inner = nr * self.T["zone_inner_frac"]
         need_s = max(0.0, d_next - inner) / walk
         outside = not me["in_zone"]
         time_left = z["shrink_end"] - t
-        urgent = outside or need_s + TUNING["zone_slack_s"] > time_left
+        urgent = outside or need_s + self.T["zone_slack_s"] > time_left
         if need_s <= 0 and not outside:
             return None, False
         if d_next < 1e-3 or nr <= 0:
@@ -496,9 +515,9 @@ class Brain:
         want_cover = False
         if enemy is not None and self.should_disengage(obs, enemy):
             want_cover = True
-        if hp_frac < TUNING["cover_hp_frac"] and (threats or recently_hit):
+        if hp_frac < self.T["cover_hp_frac"] and (threats or recently_hit):
             want_cover = True
-        if self.in_cover_mode and hp_frac < TUNING["reengage_hp_frac"] and (threats or recently_hit):
+        if self.in_cover_mode and hp_frac < self.T["reengage_hp_frac"] and (threats or recently_hit):
             want_cover = True
         if want_cover and threats:
             cv = self.find_cover(obs, threats)
@@ -521,7 +540,7 @@ class Brain:
 
         # hurt and nobody in view: heal before the next hunter arrives. Hide from recently seen enemies
         # (cubes/weapons right next to us are still fine: picking up deals no damage).
-        if hp_frac < TUNING["heal_below_frac"] and not farm:
+        if hp_frac < self.T["heal_below_frac"] and not farm:
             recent = [tr for tr in self.tracks.values() if t - tr.t < 15.0]
             near_cube = next((c for c in obs["cubes"] if hdist(p, c["pos"]) < 25 and abs(c["pos"][2] - p[2]) < 6
                               and self.goal_ok(c["pos"])), None)
@@ -546,7 +565,7 @@ class Brain:
                 return best["pos"], False, "cube", False
         if safe or not threats:
             # better weapon nearby
-            best, bd = None, TUNING["loot_radius"]
+            best, bd = None, self.T["loot_radius"]
             for pk in obs["pickups"]:
                 if int(pk["id"]) in self.bad_pickups and t - self.bad_pickups[int(pk["id"])] < 5:
                     continue
@@ -557,7 +576,7 @@ class Brain:
                     best, bd = pk, d
             if best:
                 return best["pos"], False, f"loot:{best['kind']}", False
-            best, bd = None, TUNING["cube_radius"] * (TUNING["early_farm_mult"] if t < TUNING["early_farm_s"] else 1.0)
+            best, bd = None, self.T["cube_radius"] * (self.T["early_farm_mult"] if t < self.T["early_farm_s"] else 1.0)
             for c in obs["cubes"]:
                 d = hdist(p, c["pos"])
                 if d < bd and abs(c["pos"][2] - p[2]) < 6 and self.goal_ok(c["pos"]):
@@ -569,11 +588,11 @@ class Brain:
         for dr in obs.get("drops", []):
             d = hdist(p, dr["pos"])
             walk = me["stats"].get("walk_speed", 11.7)
-            if d > TUNING["drop_max_dist"] or dr["lands_in"] > d / walk + 10:
+            if d > self.T["drop_max_dist"] or dr["lands_in"] > d / walk + 10:
                 continue
-            if hp_frac < TUNING["drop_min_hp_frac"]:
+            if hp_frac < self.T["drop_min_hp_frac"]:
                 continue
-            if any(hdist(tr.pos, dr["pos"]) < TUNING["drop_enemy_clear"] for tr in self.tracks.values()
+            if any(hdist(tr.pos, dr["pos"]) < self.T["drop_enemy_clear"] for tr in self.tracks.values()
                    if t - tr.t < 20.0):
                 continue
             if dr.get("holder") not in (None, me["id"]) or not self.goal_ok(dr["pos"]):
@@ -679,7 +698,7 @@ class Brain:
                 if d < 6:
                     mvec = (mvec[0] * max(0.4, d / 6), mvec[1] * max(0.4, d / 6))
                 boost = (urgent or not me["in_zone"] or self.mode in ("cover",)) and \
-                    energy > TUNING["boost_min_energy"] * (0.3 if not me["in_zone"] else 1)
+                    energy > self.T["boost_min_energy"] * (0.3 if not me["in_zone"] else 1)
             # an attacker we can't see / running for the zone under fire: weave
             if self.mode in ("evade", "zone!") and t - self.last_hit_taken < 3:
                 self.update_strafe(t)
@@ -761,7 +780,7 @@ class Brain:
         # or the path is old. Small goal drift (a shrinking zone) must not trigger replans.
         stale = not have_path
         if stale and self.time_ok():
-            res = self.nav.plan((p[0], p[1]), (goal[0], goal[1]), budget_ms=min(10.0, max(2.0, TUNING["time_guard_ms"] - (time.perf_counter() - self.tick_start) * 1000 - 6)))
+            res = self.nav.plan((p[0], p[1]), (goal[0], goal[1]), budget_ms=min(10.0, max(2.0, self.T["time_guard_ms"] - (time.perf_counter() - self.tick_start) * 1000 - 6)))
             if res is not None:
                 self.path, self.path_goal, self.path_t = list(res), (goal[0], goal[1]), t
                 if not res and self.mode.split(":")[0] in ("loot", "cube", "farm", "drop", "drift"):
@@ -806,7 +825,7 @@ class Brain:
             r = self.rng.random()
             self.strafe = -self.strafe if r < 0.75 else self.strafe
             self.radial_bias = self.rng.uniform(-0.4, 0.4)
-            self.next_flip = t + self.rng.uniform(*TUNING["strafe_period"])
+            self.next_flip = t + self.rng.uniform(*self.T["strafe_period"])
 
     def fight_move(self, obs, enemy: Track, retreat: bool = False):
         """Keep a weapon-appropriate range, juke sideways unpredictably, back off when losing."""
@@ -820,20 +839,20 @@ class Brain:
         want = 65.0
         for w in held:
             if w["kind"] == "lightning":
-                want = min(want, TUNING["fight_range"]["lightning"])
+                want = min(want, self.T["fight_range"]["lightning"])
             elif w["kind"] in ("laser", "mortar"):
-                want = max(want, TUNING["fight_range"][w["kind"]]) if want > 30 else want
+                want = max(want, self.T["fight_range"][w["kind"]]) if want > 30 else want
         if "lightning" in enemy.weapons and not any(w["kind"] == "lightning" for w in held):
             want = max(want, 60.0)  # stay out of arc range
         if retreat:
             radial = -1.0
         else:
             radial = max(-1.0, min(1.0, (d - want) / 25.0)) + self.radial_bias
-            finishing = enemy.hp < TUNING["finish_hp_frac"] * max(1.0, enemy.max_hp)
-            if not TUNING["chase"] and not finishing:
+            finishing = enemy.hp < self.T["finish_hp_frac"] * max(1.0, enemy.max_hp)
+            if not self.T["chase"] and not finishing:
                 radial = min(radial, 0.0)  # cautious: let them come to us; never walk into them
         strafe = 0.9 if not retreat else 0.5
-        if TUNING["two_front"]:
+        if self.T["two_front"]:
             # Another enemy nearby: strafe the way that moves us away from it, so both stay in our front
             # 180 deg arc (hits from behind do x1.5) instead of letting it flank us.
             others = [tr for tr in self.threats(obs) if tr.id != enemy.id and t - tr.seen_t < 3.0]
@@ -845,7 +864,7 @@ class Brain:
         my = math.sin(to) * radial + math.sin(to + math.pi / 2) * strafe * self.strafe
         y = math.atan2(my, mx)
         y = self.steer(p, y, me, look=6.0)
-        boost = ((retreat or d < 30) and me["energy"] > TUNING["boost_min_energy"]) or             me["energy"] > TUNING["fight_boost_energy"]
+        boost = ((retreat or d < 30) and me["energy"] > self.T["boost_min_energy"]) or             me["energy"] > self.T["fight_boost_energy"]
         return unit(y), boost
 
     def dodge(self, obs):
@@ -906,7 +925,7 @@ class Brain:
         else:
             aim = self.idle_aim(obs)
             # Start every fight with a full magazine: top up whenever nobody has been seen for a moment.
-            quiet = all(t - tr.seen_t > TUNING["reload_quiet_s"] for tr in self.tracks.values())
+            quiet = all(t - tr.seen_t > self.T["reload_quiet_s"] for tr in self.tracks.values())
             for i, w in enumerate(weapons):
                 if w and w["kind"] == "gun" and not w.get("reload") and \
                         w.get("ammo", 99) < w["stats"].get("mag", 12) * (1.0 if quiet else 0.6):
@@ -940,7 +959,7 @@ class Brain:
             ws = w["stats"]
             hd = hdist(p, tp)
             gun_busy = gun_slot is None or weapons[gun_slot].get("reload", 0) > 0 or not clear
-            if w["cooldown"] <= 0.1 and TUNING["mortar_min_range"] < hd < 0.95 * ws["speed"] ** 2 / ws["gravity"] \
+            if w["cooldown"] <= 0.1 and self.T["mortar_min_range"] < hd < 0.95 * ws["speed"] ** 2 / ws["gravity"] \
                     and (gun_busy or hd > 60 or enemy is None or enemy.vel[0] ** 2 + enemy.vel[1] ** 2 < 4):
                 tube = p[2] + st.get("height", 9.0) + 0.5
                 aim_pt, pitch = list(tp), None
@@ -957,8 +976,8 @@ class Brain:
 
         yaw_err = abs(wrap(aim[0] - cur_yaw))
         pitch_err = abs(aim[1] - cur_pitch)
-        tol_yaw = math.atan2(r * 0.85, max(dist, 1.0)) + 0.008
-        tol_pitch = math.atan2(h * 0.4, max(dist, 1.0)) + 0.008
+        tol_yaw = math.atan2(r * 0.85 * self.T["aim_tol_mult"], max(dist, 1.0)) + 0.008
+        tol_pitch = math.atan2(h * 0.4 * self.T["aim_tol_mult"], max(dist, 1.0)) + 0.008
         on_target = yaw_err < tol_yaw and pitch_err < tol_pitch
 
         for i, w in enumerate(weapons):
@@ -983,7 +1002,7 @@ class Brain:
                 rng_ok = dist < ws["range"] * 0.95
                 cone = math.radians(ws["cone_deg"]) * 0.8
                 fire[i] = rng_ok and abs(wrap(yaw_to(p, tp) - cur_yaw)) < cone and clear and \
-                    me["energy"] > TUNING["lightning_min_energy"] and w["cooldown"] <= 0
+                    me["energy"] > self.T["lightning_min_energy"] and w["cooldown"] <= 0
         return aim, fire, reload
 
     def aligned(self, me, aim, ty, tp) -> bool:

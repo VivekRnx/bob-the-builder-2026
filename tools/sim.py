@@ -118,6 +118,7 @@ class Mech:
 
 
 class Sim:
+    npc_enabled = True  # NPC drones (protocol.md section 7); False reproduces the older drone-less simulator
     def __init__(self, hello, bots: List[Any], teams: List[int], seed: int, friendly_fire_team: bool = False):
         self.rng = random.Random(seed)
         random.seed(seed)
@@ -152,6 +153,12 @@ class Sim:
                         break
         for i, (b, tm) in enumerate(zip(bots, teams)):
             self.mechs.append(Mech(i, spawns[i], self.cfg, b, tm))
+        self.npcs: Dict[int, dict] = {}
+        if self.npc_enabled:
+            for k in range(int(self.cfg["npc"]["count"])):
+                p = self._open_point()
+                self.npcs[100 + k] = {"pos": list(p), "home": list(p), "vel": [0.0, 0.0, 0.0], "aim": 0.0,
+                                      "hp": float(self.cfg["npc"]["hp"]), "target": None, "cd": 0.0, "wander": None}
         for _ in range(int(self.cfg["crates"]["count"])):
             p = self._open_point()
             self.crates[self._nid("crate")] = {"pos": p, "hp": float(self.cfg["crates"]["hp"])}
@@ -275,6 +282,15 @@ class Sim:
                               "hp": round(o.hp), "max_hp": round(o.max_hp), "cubes": o.cubes,
                               "weapons": [w.kind for w in o.weapons if w],
                               "charging": any(w and w.kind == "laser" and w.charge > 0 for w in o.weapons)})
+        if self.npcs:
+            eye = (m.pos[0], m.pos[1], m.pos[2] + 8 * m.scale)
+            nh = self.cfg["npc"]["height"]
+            for nid, n in self.npcs.items():
+                q = n["pos"]
+                if self.in_view_cheap(m, q) and self.world.los(eye, (q[0], q[1], q[2] + nh * 0.5), step=3.0, skip_start=0):
+                    mechs.append({"id": nid, "kind": "npc", "pos": [round(v, 2) for v in q],
+                                  "vel": [round(v, 2) for v in n["vel"]], "aim": [round(n["aim"], 3), 0.0],
+                                  "hp": round(n["hp"]), "max_hp": self.cfg["npc"]["hp"]})
         crates = [{"id": i, "pos": c["pos"], "hp": c["hp"]} for i, c in self.crates.items() if self.in_view_cheap(m, c["pos"])]
         cubes = [{"id": i, "pos": c["pos"]} for i, c in self.cubes.items() if self.in_view_cheap(m, c["pos"])]
         pickups = [{"id": i, "kind": p["kind"], "pos": p["pos"]} for i, p in self.pickups.items() if self.in_view_cheap(m, p["pos"])]
@@ -313,7 +329,7 @@ class Sim:
                                  "dist": "near" if d < 60 else "mid" if d < 160 else "far", "age": 0.0})
 
     # ------------------------------------------------------------------ damage
-    def damage(self, src: Optional[Mech], victim: Mech, amount, weapon, from_pos, effect=None):
+    def damage(self, src: Optional[Mech], victim: Mech, amount, weapon, from_pos, effect=None, by_id=None):
         if not victim.alive:
             return
         if src is not None and src.team is not None and src.team == victim.team and not self.squad_ff:
@@ -343,7 +359,7 @@ class Sim:
                 src.diag["gun_hits"] = src.diag.get("gun_hits", 0) + 1
         victim.last_combat = self.t
         ev = {"type": "damaged", "amount": round(amount, 1), "weapon": weapon,
-              "bearing": None if bearing is None else round(bearing, 3), "by": src.id if src else None}
+              "bearing": None if bearing is None else round(bearing, 3), "by": src.id if src else by_id}
         if rear:
             ev["rear"] = True
         victim.events.append(ev)
@@ -374,6 +390,83 @@ class Sim:
         for _ in range(v.cubes + int(self.cfg["cubes"]["death_drop_extra"])):
             self.cubes[self._nid("cube")] = {"pos": [v.pos[0] + self.rng.uniform(-3, 3), v.pos[1] + self.rng.uniform(-3, 3), v.pos[2]]}
         self.sound("death", v.pos)
+
+    def damage_npc(self, nid, amount, src: Optional[Mech], weapon):
+        n = self.npcs.get(nid)
+        if not n:
+            return
+        if src is not None:
+            amount *= 1 + self.cfg["cubes"]["damage_per_cube"] * min(src.cubes, self.cfg["cubes"]["stat_cap"])
+            src.events.append({"type": "hit", "target": nid, "amount": round(amount, 1), "weapon": weapon})
+            src.last_combat = self.t
+            n["target"] = src.id  # drones shoot back at whoever attacks them
+        n["hp"] -= amount
+        if n["hp"] <= 0:
+            del self.npcs[nid]
+            for _ in range(int(self.cfg["npc"]["cubes"])):
+                self.cubes[self._nid("cube")] = {"pos": [n["pos"][0] + self.rng.uniform(-2, 2),
+                                                         n["pos"][1] + self.rng.uniform(-2, 2), n["pos"][2]]}
+
+    def npc_tick(self):
+        nc = self.cfg["npc"]
+        for nid, n in list(self.npcs.items()):
+            n["cd"] -= DT
+            p = n["pos"]
+            dh = math.hypot(p[0] - n["home"][0], p[1] - n["home"][1])
+            tgt = self.mechs[n["target"]] if n["target"] is not None else None
+            if tgt is not None and (not tgt.alive or math.hypot(tgt.pos[0] - p[0], tgt.pos[1] - p[1]) > nc["deaggro_range"]
+                                    or dh > nc["chase_leash"]):
+                tgt, n["target"] = None, None
+            if tgt is None and dh <= nc["leash"] and int(self.t * 10) % 5 == nid % 5:  # look around ~2x/s
+                best = None
+                for m in self.mechs:
+                    if not m.alive:
+                        continue
+                    d = math.hypot(m.pos[0] - p[0], m.pos[1] - p[1])
+                    if d < nc["aggro_range"] and (best is None or d < best[0]) and self.world.los(
+                            (p[0], p[1], p[2] + 2.5), (m.pos[0], m.pos[1], m.pos[2] + m.height / 2), step=3.0, skip_start=0):
+                        best = (d, m)
+                if best:
+                    tgt = best[1]
+                    n["target"] = tgt.id
+            # movement
+            if tgt is not None:
+                goal = tgt.pos if math.hypot(tgt.pos[0] - p[0], tgt.pos[1] - p[1]) > 20 else None
+            elif dh > nc["leash"]:
+                goal = n["home"]
+            else:
+                if n["wander"] is None or math.hypot(n["wander"][0] - p[0], n["wander"][1] - p[1]) < 2:
+                    a, r = self.rng.uniform(0, 2 * math.pi), self.rng.uniform(0, nc["leash"])
+                    n["wander"] = [n["home"][0] + r * math.cos(a), n["home"][1] + r * math.sin(a)]
+                goal = n["wander"]
+            if goal is not None:
+                yaw = math.atan2(goal[1] - p[1], goal[0] - p[0])
+                spd = nc["speed"] * (1.0 if tgt is not None or dh > nc["leash"] else 0.5)
+                nx, ny = p[0] + math.cos(yaw) * spd * DT, p[1] + math.sin(yaw) * spd * DT
+                g = self.world.ground(nx, ny)
+                if not self.world.solid(nx, ny, g + 1.5) and abs(g - p[2]) < 1.5:
+                    n["vel"] = [math.cos(yaw) * spd, math.sin(yaw) * spd, 0.0]
+                    p[0], p[1], p[2] = nx, ny, g
+                else:
+                    n["vel"], n["wander"] = [0.0, 0.0, 0.0], None
+            else:
+                n["vel"] = [0.0, 0.0, 0.0]
+            # shooting
+            if tgt is not None:
+                c = (tgt.pos[0], tgt.pos[1], tgt.pos[2] + tgt.height / 2)
+                o = (p[0], p[1], p[2] + 2.5)
+                n["aim"] = math.atan2(c[1] - o[1], c[0] - o[0])
+                if n["cd"] <= 0 and self.world.los(o, c, step=3.0, skip_start=0):
+                    sp = math.radians(nc["spread_deg"])
+                    dx, dy, dz = c[0] - o[0], c[1] - o[1], c[2] - o[2]
+                    yaw = math.atan2(dy, dx) + self.rng.gauss(0, sp)
+                    pit = math.atan2(dz, math.hypot(dx, dy)) + self.rng.gauss(0, sp)
+                    v = nc["projectile_speed"]
+                    self.projectiles.append({"id": self._nid("proj"), "kind": "npc", "owner": nid, "pos": list(o),
+                                             "vel": [math.cos(pit) * math.cos(yaw) * v, math.cos(pit) * math.sin(yaw) * v,
+                                                     math.sin(pit) * v], "left": 200.0, "dmg": nc["damage"]})
+                    n["cd"] = nc["cooldown"]
+                    self.sound("npc_gun", o)
 
     def damage_crate(self, cid, amount, src: Optional[Mech]):
         c = self.crates.get(cid)
@@ -580,6 +673,16 @@ class Sim:
             if math.hypot(px - m.pos[0], py - m.pos[1]) < m.radius and m.pos[2] <= pz <= m.pos[2] + m.height:
                 if best is None or t < best[2]:
                     best = ("mech", m, t)
+        nr, nh = self.cfg["npc"]["radius"], self.cfg["npc"]["height"]
+        for nid, n in self.npcs.items():
+            if nid == exclude:
+                continue
+            q = n["pos"]
+            t = 0.0 if L2 < 1e-9 else max(0.0, min(1.0, ((q[0] - a[0]) * dx + (q[1] - a[1]) * dy) / L2))
+            px, py, pz = a[0] + dx * t, a[1] + dy * t, a[2] + dz * t
+            if math.hypot(px - q[0], py - q[1]) < nr and q[2] <= pz <= q[2] + nh:
+                if best is None or t < best[2]:
+                    best = ("npc", nid, t)
         cr, ch = self.cfg["crates"]["radius"], self.cfg["crates"]["height"]
         for cid, c in self.crates.items():
             t = 0.0 if L2 < 1e-9 else max(0.0, min(1.0, ((c["pos"][0] - a[0]) * dx + (c["pos"][1] - a[1]) * dy) / L2))
@@ -664,6 +767,8 @@ class Sim:
                 v = hit[1]
                 mult = 1 + ws["cookoff"] if any(x and x.kind == "mortar" for x in v.weapons) else 1
                 self.damage(m, v, ws["damage"] * frac * mult, "laser", m.pos, "cookoff" if mult > 1 else None)
+            elif hit[0] == "npc":
+                self.damage_npc(hit[1], ws["damage"] * frac, m, "laser")
             else:
                 self.damage_crate(hit[1], ws["damage"] * frac, m)
         for o2 in self.mechs:
@@ -686,10 +791,20 @@ class Sim:
             if d < ws["range"] and abs(wrap(math.atan2(c[1] - o[1], c[0] - o[0]) - m.aim[0])) < math.radians(ws["cone_deg"]):
                 if self.world.los(o, c, skip_start=0):
                     cands.append((d, v))
+        for nid, n in self.npcs.items():
+            q = n["pos"]
+            c = (q[0], q[1], q[2] + self.cfg["npc"]["height"] / 2)
+            d = math.dist(o, c)
+            if d < ws["range"] and abs(wrap(math.atan2(c[1] - o[1], c[0] - o[0]) - m.aim[0])) < math.radians(ws["cone_deg"]):
+                if self.world.los(o, c, skip_start=0):
+                    cands.append((d, nid))
         if not cands:
             return
         cands.sort(key=lambda x: x[0])
         tgt = cands[0][1]
+        if isinstance(tgt, int):  # a drone: no chaining in this approximation
+            self.damage_npc(tgt, ws["damage"], m, "lightning")
+            return
         dmg = ws["damage"]
         hitset = {tgt.id}
         for _ in range(int(ws["chain"]) + 1):
@@ -708,7 +823,7 @@ class Sim:
         keep = []
         g = self.cfg["weapons"]["mortar"]["gravity"]
         for p in self.projectiles:
-            owner = self.mechs[p["owner"]] if p["owner"] < len(self.mechs) else None
+            owner = self.mechs[p["owner"]] if 0 <= p["owner"] < len(self.mechs) else None
             a = list(p["pos"])
             if p["kind"] == "mortar":
                 p["vel"][2] -= g * DT
@@ -719,10 +834,15 @@ class Sim:
             end = b if wall >= seg else [a[0] + d[0] * wall, a[1] + d[1] * wall, a[2] + d[2] * wall]
             hit = self.hit_actor(a, end, p["owner"])
             done = False
-            if p["kind"] == "gun":
+            if p["kind"] in ("gun", "npc"):
                 if hit:
-                    if hit[0] == "mech":
+                    if p["kind"] == "npc":
+                        if hit[0] == "mech":
+                            self.damage(None, hit[1], p["dmg"], "npc", a, by_id=p["owner"])
+                    elif hit[0] == "mech":
                         self.damage(owner, hit[1], p["dmg"], "gun", a)
+                    elif hit[0] == "npc":
+                        self.damage_npc(hit[1], p["dmg"], owner, "gun")
                     else:
                         self.damage_crate(hit[1], p["dmg"], owner)
                     done = True
@@ -739,6 +859,8 @@ class Sim:
                         hp = [a[0] + (end[0] - a[0]) * t, a[1] + (end[1] - a[1]) * t, a[2] + (end[2] - a[2]) * t]
                         if hit[0] == "mech":
                             self.damage(owner, hit[1], p["dmg"], "mortar", a)
+                        elif hit[0] == "npc":
+                            self.damage_npc(hit[1], p["dmg"], owner, "mortar")
                     self.explode(owner, hp)
                     done = True
             p["pos"] = end
@@ -765,6 +887,8 @@ class Sim:
             v.vel[2] += ws["knock_up"] * f
             v.grounded = False
             v.energy = max(0.0, v.energy - ws["drain"] * f)
+        for nid in [nid for nid, n in self.npcs.items() if math.dist(n["pos"], at) < R + self.cfg["npc"]["radius"]]:
+            self.damage_npc(nid, ws["splash"] * 0.6, owner, "mortar")
         for cid in [cid for cid, c in self.crates.items() if math.dist(c["pos"], at) < R]:
             self.damage_crate(cid, ws["splash"] * 0.6, owner)
         self.sound("explosion", at)
@@ -880,6 +1004,7 @@ class Sim:
                         self.step_mech(m)
                         self.weapons_tick(m)
                 self.projectiles_tick()
+                self.npc_tick()
                 self.world_tick()
                 self.t += DT
                 self.tick += 1

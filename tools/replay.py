@@ -41,13 +41,13 @@ class RecordingSim(sim.Sim):
         self.feed = []
         super().__init__(*a, **kw)
 
-    def damage(self, src, victim, amount, weapon, from_pos, effect=None):
+    def damage(self, src, victim, amount, weapon, from_pos, effect=None, by_id=None):
         if src is not None and victim.alive and weapon in ("lightning", "laser"):
             self.fx.append(["arc" if weapon == "lightning" else "beam", r1(src.pos[0]), r1(src.pos[1]),
                             r1(victim.pos[0]), r1(victim.pos[1])])
         if src is not None and victim.alive and weapon in ("gun", "mortar", "laser", "lightning"):
             self.fx.append(["hit", r1(victim.pos[0]), r1(victim.pos[1]), round(amount)])
-        super().damage(src, victim, amount, weapon, from_pos, effect)
+        super().damage(src, victim, amount, weapon, from_pos, effect, by_id)
 
     def fire_laser(self, m, w):
         o, d = self.muzzle(m)
@@ -102,6 +102,8 @@ def build(seed, mode, hero_spec, opp_spec, max_t=None):
              "m": ms,
              "p": [[r1(p["pos"][0]), r1(p["pos"][1]), 1 if p["kind"] == "mortar" else 0] for p in S.projectiles],
              "c": [[r1(c["pos"][0]), r1(c["pos"][1])] for c in S.crates.values()],
+             "n": [[r1(n["pos"][0]), r1(n["pos"][1]), round(n["hp"]), 1 if n["target"] is not None else 0]
+                   for n in S.npcs.values()],
              "q": [[r1(c["pos"][0]), r1(c["pos"][1])] for c in S.cubes.values()],
              "w": [[r1(p["pos"][0]), r1(p["pos"][1]), W_CODE.get(p["kind"], 0)] for p in S.pickups.values()],
              "d": [[r1(d["pos"][0]), r1(d["pos"][1]), round(max(0.0, d["lands"] - S.t), 1), d["holder"]]

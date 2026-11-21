@@ -140,7 +140,8 @@ function load(data) {
   const roles = [...new Set(Object.values(meta.roles))];
   L.innerHTML = roles.map(r => `<span class="dot" style="background:${ROLE_COLOR[r]}"></span>${r}`).join("") +
     `<span class="dot" style="background:transparent;border:2px solid #eb5757;width:11px;height:11px"></span>hunting you` +
-    `<span class="dot" style="background:#3ea6ff"></span>bot debug`;
+    `<span class="dot" style="background:#3ea6ff"></span>bot debug` +
+    `<span class="dot" style="background:#b07cc6;border-radius:0"></span>drone (pink = attacking)`;
   buildFeed();
   t = 0; resetView(); render();
 }
@@ -251,6 +252,8 @@ function render() {
   ctx.setLineDash([6, 6]); circle(z[3], z[4], z[5]); ctx.strokeStyle = "rgba(255,255,255,0.55)"; ctx.lineWidth = 1.5; ctx.stroke(); ctx.setLineDash([]);
   // loot: crates, cubes, weapon pickups, drops
   for (const c of f.c || []) { const [sx, sy] = W2S(c[0], c[1]); ctx.fillStyle = "#8a6a3a"; ctx.fillRect(sx - 3, sy - 3, 6, 6); }
+  for (const n of f.n || []) { const [sx, sy] = W2S(n[0], n[1]);
+    ctx.fillStyle = n[3] ? "#ff6bd6" : "#b07cc6"; ctx.beginPath(); ctx.moveTo(sx, sy - 5); ctx.lineTo(sx + 4.5, sy + 4); ctx.lineTo(sx - 4.5, sy + 4); ctx.closePath(); ctx.fill(); }
   for (const c of f.q || []) { const [sx, sy] = W2S(c[0], c[1]); ctx.fillStyle = "#5ff2e0";
     ctx.beginPath(); ctx.moveTo(sx, sy - 4); ctx.lineTo(sx + 4, sy); ctx.lineTo(sx, sy + 4); ctx.lineTo(sx - 4, sy); ctx.fill(); }
   ctx.font = "bold 10px system-ui"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
