@@ -131,26 +131,30 @@ class World:
         return True
 
     def probe(self, x: float, y: float, z: float, yaw: float, dist: float,
-              step_up: float = 1.2, height: float = 9.0, max_slope_deg: float = 50.0, step: float = 1.5) -> float:
+              step_up: float = 1.2, height: float = 9.0, max_slope_deg: float = 50.0, step: float = 1.5,
+              radius: float = 2.5) -> float:
         """Walk a straight line from feet (x, y, z) along `yaw` and return how far you get (<= dist)
-        before a wall, a too-steep slope or the map edge. Heuristic: ignores your radius except via
-        the caller's margin, and lets you drop off ledges."""
+        before a wall, a too-steep slope or the map edge. Checks the body's full width (center and both
+        sides at `radius`), so gaps narrower than the mech count as walls. Lets you drop off ledges."""
         c, s = math.cos(yaw), math.sin(yaw)
         slope = math.tan(math.radians(max_slope_deg)) * step
+        sides = ((0.0, 0.0), (-s * radius, c * radius), (s * radius, -c * radius))
         feet = z
         k = 1
         while k * step <= dist:
-            px, py = x + c * k * step, y + s * k * step
-            if not self.in_bounds(px, py):
+            cx, cy = x + c * k * step, y + s * k * step
+            if not self.in_bounds(cx, cy, radius + 0.5):
                 return (k - 1) * step
-            g = self.ground(px, py)
+            g = self.ground(cx, cy)
             if g > feet + max(step_up, slope):
                 return (k - 1) * step
-            for p in self.prisms_at(px, py):
-                # A prism blocks if it overlaps our body height and we can't step onto it.
-                if p.base < feet + height and p.top > feet + step_up and p.covers(px, py):
-                    return (k - 1) * step
-            feet = self.floor_under(px, py, feet, step_up)
+            for ox, oy in sides:
+                px, py = cx + ox, cy + oy
+                for p in self.prisms_at(px, py):
+                    # A prism blocks if it overlaps our body height and we can't step onto it.
+                    if p.base < feet + height and p.top > feet + step_up and p.covers(px, py):
+                        return (k - 1) * step
+            feet = self.floor_under(cx, cy, feet, step_up)
             k += 1
         return dist
 

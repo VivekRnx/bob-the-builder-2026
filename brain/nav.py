@@ -72,6 +72,54 @@ class NavGrid:
                             break
         self.max_dz = max(step_up, slope * cell * 0.9)
         self._search: Optional[dict] = None
+        self._components()
+
+    def _components(self) -> None:
+        """Label walkable regions (4-connected). Small regions are courtyards/pockets you can only leave
+        by jetting over a wall; `main` is the big connected campus."""
+        from collections import deque
+        nx, ny, free, ground, max_dz = self.nx, self.ny, self.free, self.ground, self.max_dz
+        comp = [-1] * (nx * ny)
+        sizes: List[int] = []
+        for k in range(nx * ny):
+            if not free[k] or comp[k] >= 0:
+                continue
+            c = len(sizes)
+            comp[k] = c
+            q = deque([k])
+            n = 0
+            while q:
+                u = q.popleft()
+                n += 1
+                i, j = u % nx, u // nx
+                for v, ok in ((u + 1, i + 1 < nx), (u - 1, i > 0), (u + nx, j + 1 < ny), (u - nx, j > 0)):
+                    if ok and free[v] and comp[v] < 0 and abs(ground[v] - ground[u]) <= max_dz:
+                        comp[v] = c
+                        q.append(v)
+            sizes.append(n)
+        self.comp = comp
+        self.comp_size = sizes
+        self.main = max(range(len(sizes)), key=lambda c: sizes[c]) if sizes else -1
+
+    def component_at(self, x: float, y: float) -> int:
+        c = self.nearest_free(*self.cell_of(x, y), 3)
+        return self.comp[c[1] * self.nx + c[0]] if c else -1
+
+    def nearest_in_component(self, x: float, y: float, comp: int, max_r: int = 40) -> Optional[Tuple[float, float]]:
+        """Closest cell center (ignoring walls) that belongs to region `comp`."""
+        i, j = self.cell_of(x, y)
+        for r in range(1, max_r + 1):
+            best = None
+            for di in range(-r, r + 1):
+                for dj in (-r, r) if abs(di) != r else range(-r, r + 1):
+                    ni, nj = i + di, j + dj
+                    if 0 <= ni < self.nx and 0 <= nj < self.ny and self.comp[nj * self.nx + ni] == comp:
+                        d = di * di + dj * dj
+                        if best is None or d < best[0]:
+                            best = (d, ni, nj)
+            if best:
+                return self.center(best[1], best[2])
+        return None
 
     # ------------------------------------------------------------------ helpers
     def cell_of(self, x: float, y: float) -> Tuple[int, int]:

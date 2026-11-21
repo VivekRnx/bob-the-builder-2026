@@ -118,13 +118,16 @@ class Brain:
         self.side = 1.0
         self.mode = "start"
         self.path: List[Tuple[float, float]] = []
-        self.path_goal: Optional[Tuple[float, float]] = None
+        self.path_goal: Optional[Tuple[float, float]] = None  # goal the current path was planned to
         self.path_t = -99.0
         self.cover: Optional[Tuple[float, float]] = None
         self.cover_t = -99.0
         self.in_cover_mode = False
         self.t = 0.0
         self.tick_start = 0.0
+        self.rad = 2.5
+        self.zone_urgent_until = -1.0
+        self.climbing = False
         self.target_id: Optional[int] = None
         self.goal_bad: Dict[Tuple[int, int], float] = {}  # goal cell -> time it was given up
         self.goal_key: Optional[Tuple[int, int]] = None
@@ -136,6 +139,7 @@ class Brain:
         self.tick_start = time.perf_counter()
         self.t = t = obs["t"]
         me = obs["self"]
+        self.rad = float(me["stats"].get("radius", 2.5))
         self.perceive(obs)
         act: Dict[str, Any] = {}
 
@@ -160,7 +164,7 @@ class Brain:
         if dodge is not None:
             move, boost = dodge
             self.mode = mode = mode + "+dodge"
-        if not me["grounded"] and t >= self.unstick_until and not mode.startswith("zone!"):
+        if not me["grounded"] and t >= self.unstick_until and not mode.startswith("zone!") and not self.climbing:
             boost = False  # boost in the air = jets: only on purpose
         aim, fire, reload = self.combat(obs, enemy, farm)
         if mode.startswith("cover") and enemy is not None and not self.has_los_to(me, enemy):
@@ -450,6 +454,10 @@ class Brain:
         p, t = me["pos"], obs["t"]
         hp_frac = me["hp"] / me["max_hp"]
         zone_pt, urgent = self.zone_status(obs)
+        if urgent:
+            self.zone_urgent_until = t + 3.0
+        elif zone_pt and t < self.zone_urgent_until:
+            urgent = True  # sticky: don't toggle between running for the zone and other goals
         if urgent and zone_pt:
             self.in_cover_mode = False
             return zone_pt, True, "zone!", False
@@ -569,7 +577,7 @@ class Brain:
                 x, y = p[0] + math.cos(yaw) * r, p[1] + math.sin(yaw) * r
                 if self.nav is not None and not self.nav.is_free(*self.nav.cell_of(x, y)):
                     continue
-                if w.probe(p[0], p[1], p[2], yaw, r, self.step_up, 9.0, self.max_slope) < r - 0.5:
+                if w.probe(p[0], p[1], p[2], yaw, r, self.step_up, 9.0, self.max_slope, radius=self.rad) < r - 0.5:
                     continue
                 gz = w.floor_under(x, y, p[2], self.step_up)
                 mid = (x, y, gz + 4.5)
@@ -603,6 +611,20 @@ class Brain:
         boost = jump = False
         mvec = (0.0, 0.0)
 
+        self.climbing = False
+        exit_pt = self.pocket_exit(p, goal) if goal is not None else None
+        if exit_pt is not None and not (fight_move and enemy is not None and hdist(p, enemy.pos) < 60):
+            # Walled-in pocket (courtyard): the only way out is up. Fill energy, then jump + jet over the wall.
+            self.climbing = True
+            self.mode += "+climb"
+            full = me["energy"] >= 0.9 * me.get("max_energy", 100)
+            airborne = not me["grounded"]
+            if airborne or full:
+                mvec = unit(yaw_to(p, exit_pt))
+                jump = me["grounded"]
+                boost = me["energy"] > 1
+            n = math.hypot(*mvec)
+            return [round(mvec[0], 3), round(mvec[1], 3)], jump, boost
         if fight_move and enemy is not None:
             mvec, boost = self.fight_move(obs, enemy, retreat=self.mode == "retreat")
         elif goal is not None:
@@ -631,10 +653,42 @@ class Brain:
             boost = energy > 8
             if mvec == (0.0, 0.0) and goal is not None:
                 mvec = unit(yaw_to(p, goal))
+            esc = self.escape_point(p)
+            if esc is not None:  # wedged somewhere unwalkable: back out to open ground first
+                mvec = unit(yaw_to(p, esc))
         n = math.hypot(*mvec)
         if n > 1:
             mvec = (mvec[0] / n, mvec[1] / n)
         return [round(mvec[0], 3), round(mvec[1], 3)], jump, boost
+
+    def pocket_exit(self, p, goal) -> Optional[Tuple[float, float]]:
+        """If we're on the ground in a small walled-in region and the goal is outside it: where to jet to."""
+        nav = self.nav
+        if nav is None or nav.main < 0:
+            return None
+        i, j = nav.cell_of(p[0], p[1])
+        if p[2] > nav.ground[j * nav.nx + i] + 3.0:
+            return None  # on a roof / in the air above ground level: normal steering handles it
+        mine = nav.component_at(p[0], p[1])
+        if mine < 0 or mine == nav.main or nav.comp_size[mine] > 2500:
+            return None
+        if nav.component_at(goal[0], goal[1]) == mine:
+            return None
+        return nav.nearest_in_component(p[0], p[1], nav.main)
+
+    def escape_point(self, p) -> Optional[Tuple[float, float]]:
+        """If we stand in a cell the nav grid calls unwalkable (wedged in a gap, on a ledge), the center
+        of the nearest walkable cell; else None."""
+        if self.nav is None:
+            return None
+        i, j = self.nav.cell_of(p[0], p[1])
+        if self.nav.is_free(i, j):
+            return None
+        g = self.nav.ground[j * self.nav.nx + i]
+        if p[2] > g + 3.0:
+            return None  # on a roof: walking off the edge is fine
+        c = self.nav.nearest_free(i, j, 6)
+        return self.nav.center(*c) if c else None
 
     def route_yaw(self, obs, goal) -> float:
         """Heading toward goal: straight if walkable, else along an A* path."""
@@ -648,32 +702,43 @@ class Brain:
         look = min(d, 24.0)
         on_roof = self.nav is not None and p[2] > self.nav.ground[self.nav.cell_of(p[0], p[1])[1] * self.nav.nx +
                                                                    self.nav.cell_of(p[0], p[1])[0]] + 3.0
-        if self.world.probe(p[0], p[1], p[2], gy, look, self.step_up, h, self.max_slope) >= look - 0.1 or \
-                self.nav is None or on_roof:
+        have_path = bool(self.path) and self.path_goal is not None and \
+            hdist(self.path_goal, goal) <= 20.0 and t - self.path_t <= 10.0
+        # Go straight only when we aren't already following a path, or the goal is close and clear.
+        # (Hysteresis: a path exists because the straight line is blocked further on than the probe
+        # looks; dropping it whenever the next 24 m look clear makes the bot dither in place.)
+        if self.nav is None or on_roof or (
+                (not have_path or d < 25) and
+                self.world.probe(p[0], p[1], p[2], gy, look, self.step_up, h, self.max_slope,
+                                 radius=self.rad) >= look - 0.1):
             self.path = []
             return self.steer(p, gy, me)
-        # need a path
-        gkey = (round(goal[0] / 8), round(goal[1] / 8))
-        if not self.path or self.path_goal != gkey or t - self.path_t > 8.0:
-            if self.time_ok():
-                res = self.nav.plan((p[0], p[1]), (goal[0], goal[1]), budget_ms=min(10.0, max(2.0, TUNING["time_guard_ms"] - (time.perf_counter() - self.tick_start) * 1000 - 6)))
-                if res is not None:
-                    self.path, self.path_goal, self.path_t = res, gkey, t
-                    if not res and self.mode.split(":")[0] in ("loot", "cube", "farm", "drop", "drift"):
-                        self.give_up(goal)
+        # need a path: (re)plan when there is none, the goal moved > 20 m from where the path ends,
+        # or the path is old. Small goal drift (a shrinking zone) must not trigger replans.
+        stale = not have_path
+        if stale and self.time_ok():
+            res = self.nav.plan((p[0], p[1]), (goal[0], goal[1]), budget_ms=min(10.0, max(2.0, TUNING["time_guard_ms"] - (time.perf_counter() - self.tick_start) * 1000 - 6)))
+            if res is not None:
+                self.path, self.path_goal, self.path_t = list(res), (goal[0], goal[1]), t
+                if not res and self.mode.split(":")[0] in ("loot", "cube", "farm", "drop", "drift"):
+                    self.give_up(goal)
+                if self.path:  # start from the nearest waypoint, never walk back to the start cell
+                    k = min(range(min(len(self.path), 12)), key=lambda i: hdist(p, self.path[i]))
+                    self.path = self.path[k:]
         if self.path:
-            # drop reached waypoints, then aim at the farthest of the next few that is directly walkable
-            while len(self.path) > 1 and hdist(p, self.path[0]) < 4.0:
+            # drop reached waypoints, and any waypoint that is behind us relative to the next one
+            while len(self.path) > 1 and (hdist(p, self.path[0]) < 4.0 or
+                                          hdist(p, self.path[1]) < hdist(self.path[0], self.path[1])):
                 self.path.pop(0)
             # if we've wandered off the path, rejoin at the nearest waypoint
             if hdist(p, self.path[0]) > 20:
                 k = min(range(min(len(self.path), 40)), key=lambda i: hdist(p, self.path[i]))
                 self.path = self.path[k:]
             tgt = self.path[0]
-            for wp in self.path[1:7]:
+            for wp in self.path[1:8]:
                 dd = hdist(p, wp)
                 y = yaw_to(p, wp)
-                if self.world.probe(p[0], p[1], p[2], y, dd, self.step_up, h, self.max_slope) >= dd - 0.5:
+                if self.world.probe(p[0], p[1], p[2], y, dd, self.step_up, h, self.max_slope, radius=self.rad) >= dd - 0.5:
                     tgt = wp
                 else:
                     break
@@ -688,7 +753,7 @@ class Brain:
         look = max(3.0, look)
         for off in (0, 20, -20, 45, -45, 70, -70, 100, -100, 140, -140):
             y = goal_yaw + math.radians(off) * self.side
-            if self.world.probe(p[0], p[1], p[2], y, look, self.step_up, h, self.max_slope) >= look - 0.1:
+            if self.world.probe(p[0], p[1], p[2], y, look, self.step_up, h, self.max_slope, radius=self.rad) >= look - 0.1:
                 return y
         return goal_yaw  # boxed in: push on and let unstick (jets) handle it
 

@@ -147,6 +147,22 @@ def test_gives_up_unreachable_goal():
     assert not b.goal_ok(goal)
 
 
+def test_climbs_out_of_courtyard():
+    """Spawned in a walled-in courtyard (420, 30): wait for energy, then jump + jet toward open ground."""
+    b, o = fresh()
+    w = b.world
+    o["self"]["pos"] = [420.0, 30.0, w.ground(420, 30)]
+    o["self"]["vel"] = [0.0, 0.0, 0.0]
+    o["mechs"] = []
+    o["self"]["energy"] = 40
+    o["self"]["in_zone"] = False
+    a = b.act(o)
+    assert "climb" in b.mode and a["move"] == [0, 0] and not a["jump"], (b.mode, a)  # charge energy first
+    o["self"]["energy"] = 100
+    a = b.act(o)
+    assert "climb" in b.mode and a["jump"] and a["boost"] and a["move"] != [0, 0], (b.mode, a)
+
+
 if __name__ == "__main__":
     failed = 0
     for name, fn in list(globals().items()):

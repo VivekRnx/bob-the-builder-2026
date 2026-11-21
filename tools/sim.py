@@ -100,6 +100,7 @@ class Mech:
         self.fire = [False, False]
         self.act_ms: List[float] = []
         self.thresh_i = 0
+        self.hits_log = []
         self.diag = {"death_t": None, "death_by": None, "stuck_s": 0.0, "out_s": 0.0, "dealt": 0.0, "taken": 0.0,
                      "shots": 0, "zone_dmg": 0.0}
 
@@ -329,6 +330,8 @@ class Sim:
             bearing = None
         victim.hp -= amount
         victim.diag["taken"] += amount
+        if src is not None:
+            victim.hits_log.append((self.t, src.id))
         if weapon == "zone":
             victim.diag["zone_dmg"] += amount
         if src is not None:
@@ -354,6 +357,8 @@ class Sim:
         v.alive = False
         v.hp = 0
         v.diag["death_t"] = round(self.t, 1)
+        v.diag["attackers8s"] = len({sid for (tt, sid) in v.hits_log if self.t - tt < 8.0})
+        v.diag["hp_at_fight"] = None
         v.diag["death_by"] = (src.id if src else "zone")
         self.dead_order.append(v.id)
         v.place = sum(m.alive for m in self.mechs) + 1
@@ -824,7 +829,8 @@ class Sim:
         dead = sum(1 for m in self.mechs if m.team is not None and not m.alive)
         k = len(squad) if self.t >= self.hunt_all_t else min(len(squad), 1 + dead)
         tgt = lone[0]
-        squad.sort(key=lambda m: math.dist(m.pos, tgt.pos))
+        tier = getattr(self, "tier", {})
+        squad.sort(key=lambda m: (tier.get(m.id, 0), math.dist(m.pos, tgt.pos)))
         self.hunters = {m.id for m in squad[:k]}
 
     # ------------------------------------------------------------------ loop
@@ -884,15 +890,27 @@ def import_bot(spec: str):
     return getattr(mod, "Brain")
 
 
-def run_match(args):
-    seed, mode, hero_spec, opp_spec, omni = args
+def setup_match(seed, mode, hero_spec, opp_spec, omni=False):
+    """Build a Sim exactly like run_match does: (sim, hero_ids)."""
     hello = load_hello()
-    hero, opp = import_bot(hero_spec), import_bot(opp_spec)
+    hero = import_bot(hero_spec)
+    # opp may be "easy,medium,hard,expert" specs (4/4/4/3 bots, hunting weakest tier first, like practice)
+    tiers = [import_bot(x) for x in opp_spec.split(",")]
+    tier_of = [min(len(tiers) - 1, i * len(tiers) // 15) for i in range(15)] if len(tiers) > 1 else [0] * 15
+    if len(tiers) == 4:
+        tier_of = [0] * 4 + [1] * 4 + [2] * 4 + [3] * 3
+    opp = tiers[0]
     rng = random.Random(seed)
     hero_slot = None
+    mech_tier = {}
     if mode == "squad":
         hero_slot = rng.randrange(16)
-        bots = [hero if i == hero_slot else opp for i in range(16)]
+        order = [i for i in range(16) if i != hero_slot]
+        rng.shuffle(order)
+        bots = [hero] * 16
+        for k, i in enumerate(order):
+            bots[i] = tiers[tier_of[k]]
+            mech_tier[i] = tier_of[k]
         teams = [None if i == hero_slot else 1 for i in range(16)]
     elif mode == "duel":
         bots, teams = [hero, opp], [None, None]
@@ -901,10 +919,17 @@ def run_match(args):
         teams = [None] * 16
     sim = Sim(hello, bots, teams, seed)
     sim.omniscient = omni
+    sim.tier = mech_tier
+    hero_ids = [hero_slot] if mode == "squad" else [0] if mode == "duel" else [i for i in range(16) if i % 2 == 0]
+    return sim, hero_ids
+
+
+def run_match(args):
+    seed, mode, hero_spec, opp_spec, omni = args
+    sim, hero_ids = setup_match(seed, mode, hero_spec, opp_spec, omni)
     t0 = time.time()
     res = sim.run()
     acts = [x for m in sim.mechs for x in m.act_ms]
-    hero_ids = [hero_slot] if mode == "squad" else [0] if mode == "duel" else [i for i in range(16) if i % 2 == 0]
     hero_ms = max((x for m in sim.mechs if m.id in hero_ids for x in m.act_ms), default=0)
     diags = {m.id: dict(m.diag, place=m.place, kills=m.kills, cubes=m.cubes, w=[w.kind for w in m.weapons if w])
              for m in sim.mechs}
