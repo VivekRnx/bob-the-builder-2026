@@ -29,6 +29,28 @@ python tools/trace.py 7 --to 60                            # print what our bot 
 sh scripts/check.sh --docker                               # tests + bench + check, then the Docker sandbox check
 ```
 
+## Watching simulated matches
+
+```sh
+python tools/replay.py 142 --open              # record sim match seed 142, open it in your browser
+python tools/replay.py 7 --mode ffa --open     # free-for-all
+python tools/replay.py 142 --hero tools.baseline.brain_v2 --open   # same seed, older bot, to compare
+```
+
+This writes a self-contained `replays/<mode>_<seed>.html` that you open by double-clicking. It shows:
+
+- the campus top-down, with buildings shaded by height and the zone plus the dashed next circle
+- every mech, colored by role (ours green, house tiers grey → red, red ring = hunting you), with aim
+  line, HP bar, and a dot for its second weapon
+- bullets, mortar shells, explosions, laser and lightning hits, and floating damage numbers
+- crates, cubes, weapon pickups and supply drops
+- **our bot's debug drawing**: its planned A* path, goal point and current mode, so you can see *why* it moved
+
+Controls: Space play/pause · ←/→ ±2 s · `,`/`.` step · 1–6 speed · wheel zoom · drag pan ·
+double-click reset. Click a mech in the side panel to follow it, or a kill in the feed to jump there;
+kill ticks on the timeline are green for yours and white for your death. Use the same seed as a bad
+result in `tools/sim.py --diag` to watch exactly what went wrong.
+
 ## Layout
 
 | Path | What |
@@ -41,7 +63,8 @@ sh scripts/check.sh --docker                               # tests + bench + che
 | [brain/world.py](brain/world.py) | Map model from `/arena`: terrain height, buildings, line of sight, walkability probe. |
 | [brain/geom.py](brain/geom.py) | Angles, projectile lead (intercept), mortar ballistic pitch. |
 | [tools/sim.py](tools/sim.py) | **Local match simulator** written from protocol.md: physics, walls, vision, all weapons, zone, loot, cubes, upgrades, drops, and a practice-like hunting squad. |
-| [tools/trace.py](tools/trace.py) | Step-by-step trace of our bot in one simulated match. |
+| [tools/trace.py](tools/trace.py) | Step-by-step text trace of our bot in one simulated match. |
+| [tools/replay.py](tools/replay.py), [tools/viewer.html](tools/viewer.html) | Record a sim match and watch it in the browser. |
 | [tools/baseline/brain_v1/](tools/baseline/brain_v1/) | The first version of the bot, kept as the opponent and A/B reference. |
 | [tools/bench.py](tools/bench.py), [tools/test_brain.py](tools/test_brain.py) | Latency/crash replay and scenario tests. Add a test for every bug you fix. |
 | [mechfight-kit/](mechfight-kit/) | The official kit, unmodified: protocol, schema, check, map, the TS wrapper. Not copied into the image. |

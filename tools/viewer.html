@@ -1,0 +1,439 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Mech Royale replay</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #0f1115; --panel: #161a21; --line: #262c36; --text: #d7dce4; --muted: #8a93a3;
+    --hero: #3ee07a; --easy: #9aa4b2; --medium: #f2c94c; --hard: #f2994a; --expert: #eb5757; --opp: #56ccf2;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 13px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  #app { display: grid; grid-template-columns: 1fr 320px; grid-template-rows: auto 1fr auto; height: 100vh; }
+  header { grid-column: 1 / 3; display: flex; gap: 16px; align-items: baseline; padding: 8px 14px;
+    border-bottom: 1px solid var(--line); background: var(--panel); }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  header .meta { color: var(--muted); }
+  header .result { margin-left: auto; font-weight: 600; }
+  #stage { position: relative; overflow: hidden; }
+  canvas#view { width: 100%; height: 100%; display: block; cursor: grab; }
+  canvas#view.dragging { cursor: grabbing; }
+  #hud { position: absolute; left: 10px; top: 10px; background: rgba(15,17,21,.8); border: 1px solid var(--line);
+    border-radius: 6px; padding: 6px 9px; pointer-events: none; font-variant-numeric: tabular-nums; }
+  #legend { position: absolute; left: 10px; bottom: 10px; background: rgba(15,17,21,.8); border: 1px solid var(--line);
+    border-radius: 6px; padding: 6px 9px; color: var(--muted); font-size: 12px; }
+  #legend span.dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin: 0 4px 0 10px; vertical-align: -1px; }
+  #legend span.dot:first-child { margin-left: 0; }
+  aside { border-left: 1px solid var(--line); background: var(--panel); overflow: auto; padding: 10px 12px; }
+  aside h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 6px 0 6px; font-weight: 600; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  td { padding: 3px 4px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  tr.row { cursor: pointer; }
+  tr.row:hover td { background: #1d222b; }
+  tr.row.sel td { background: #1f2a22; }
+  tr.dead td { color: #5b6270; }
+  .sw { display: inline-block; width: 9px; height: 9px; border-radius: 50%; vertical-align: -1px; }
+  .hpbar { width: 64px; height: 6px; background: #2a303b; border-radius: 3px; overflow: hidden; display: inline-block; vertical-align: 1px; }
+  .hpbar > i { display: block; height: 100%; background: var(--hero); }
+  .mode { color: var(--muted); font-size: 11px; max-width: 90px; overflow: hidden; text-overflow: ellipsis; display: inline-block; vertical-align: bottom; }
+  #feed div { padding: 3px 0; border-bottom: 1px solid var(--line); cursor: pointer; }
+  #feed div:hover { color: #fff; }
+  #feed .ft { color: var(--muted); display: inline-block; width: 44px; font-variant-numeric: tabular-nums; }
+  footer { grid-column: 1 / 3; display: flex; gap: 10px; align-items: center; padding: 8px 14px;
+    border-top: 1px solid var(--line); background: var(--panel); }
+  button, select { background: #222833; color: var(--text); border: 1px solid #333b48; border-radius: 5px;
+    padding: 4px 10px; font: inherit; cursor: pointer; }
+  button:hover, select:hover { border-color: #4a5466; }
+  #scrubwrap { position: relative; flex: 1; height: 26px; }
+  #scrub { position: absolute; inset: 6px 0 auto 0; width: 100%; margin: 0; }
+  #ticks { position: absolute; left: 0; right: 0; top: 0; height: 6px; pointer-events: none; }
+  #ticks i { position: absolute; top: 0; width: 2px; height: 6px; background: var(--expert); }
+  #ticks i.herok { background: var(--hero); }
+  #ticks i.herod { background: #fff; width: 3px; }
+  #time { font-variant-numeric: tabular-nums; min-width: 92px; text-align: right; }
+  label.chk { color: var(--muted); user-select: none; }
+  .kbd { color: var(--muted); font-size: 11px; }
+  #drop { position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
+    background: rgba(15,17,21,.92); font-size: 16px; color: var(--muted); }
+  #drop.show { display: flex; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>Mech Royale replay</h1>
+    <span class="meta" id="meta"></span>
+    <span class="result" id="result"></span>
+  </header>
+  <div id="stage">
+    <canvas id="view"></canvas>
+    <div id="hud"></div>
+    <div id="legend"></div>
+    <div id="drop">Drop a replay .json here, or run <code>&nbsp;python tools/replay.py SEED&nbsp;</code></div>
+  </div>
+  <aside>
+    <h2>Mechs</h2>
+    <table id="roster"></table>
+    <h2 style="margin-top:14px">Kills</h2>
+    <div id="feed"></div>
+    <h2 style="margin-top:14px">Keys</h2>
+    <div class="kbd">Space play/pause · ←/→ ±2 s · ,/. step · F follow · D debug · 1–6 speed ·
+      wheel zoom · drag pan · double-click reset · click a mech row to follow it</div>
+  </aside>
+  <footer>
+    <button id="play">▶ Play</button>
+    <select id="speed">
+      <option value="0.5">0.5×</option><option value="1">1×</option><option value="2">2×</option>
+      <option value="4" selected>4×</option><option value="8">8×</option><option value="16">16×</option>
+    </select>
+    <div id="scrubwrap"><div id="ticks"></div><input type="range" id="scrub" min="0" max="1000" value="0" step="1"></div>
+    <span id="time">0:00.0</span>
+    <label class="chk"><input type="checkbox" id="follow" checked> follow</label>
+    <label class="chk"><input type="checkbox" id="debug" checked> bot debug</label>
+    <label class="chk"><input type="checkbox" id="labels" checked> labels</label>
+  </footer>
+</div>
+<script>
+"use strict";
+let DATA = /*__REPLAY_DATA__*/null;
+
+const ROLE_COLOR = { hero: "#3ee07a", easy: "#9aa4b2", medium: "#f2c94c", hard: "#f2994a", expert: "#eb5757",
+                     squad: "#eb5757", opp: "#56ccf2" };
+const WEAPON = ["gun", "mortar", "laser", "lightning"];
+const WEAPON_COLOR = ["#cfd6e0", "#f2994a", "#ff5a5a", "#6fd3ff"];
+
+const cv = document.getElementById("view"), ctx = cv.getContext("2d");
+const $ = (id) => document.getElementById(id);
+let frames = [], meta = null, buildings = [];
+let t = 0, playing = false, speed = 4, follow = null, showDebug = true, showLabels = true;
+let view = { cx: 0, cy: 0, scale: 1 }, userMoved = false;
+let deadPos = {};          // id -> [x, y, t]
+let lastPos = {};          // id -> [x, y]
+
+function load(data) {
+  DATA = data; meta = data.meta; frames = data.frames; buildings = data.buildings;
+  follow = meta.hero_ids[0];
+  // pre-compute where each mech died (for X markers) and the timeline ticks
+  deadPos = {}; lastPos = {};
+  for (const f of frames) {
+    for (const m of f.m) lastPos[m[0]] = [m[1], m[2]];
+    if (f.k) for (const [kt, vid, by] of f.k) deadPos[vid] = [...(lastPos[vid] || [0, 0]), kt, by];
+  }
+  const hero = meta.hero_ids[0];
+  $("meta").textContent = `seed ${meta.seed} · ${meta.mode} · hero: ${meta.hero} · ${frames.length} frames`;
+  const hp = meta.places[hero];
+  $("result").textContent = `Hero #${hero}: place ${hp} → ${16 - hp} pts · ${meta.kills[hero]} kills`;
+  $("result").style.color = ROLE_COLOR.hero;
+  const end = frames[frames.length - 1].t, ticks = $("ticks");
+  ticks.innerHTML = "";
+  for (const [id, d] of Object.entries(deadPos)) {
+    const i = document.createElement("i");
+    i.style.left = (100 * d[2] / end) + "%";
+    if (+id === hero) i.className = "herod"; else if (d[3] === hero) i.className = "herok";
+    i.title = `t=${d[2]}s: #${id} died` + (d[3] >= 0 ? ` (by #${d[3]})` : " (zone)");
+    ticks.appendChild(i);
+  }
+  const L = $("legend");
+  const roles = [...new Set(Object.values(meta.roles))];
+  L.innerHTML = roles.map(r => `<span class="dot" style="background:${ROLE_COLOR[r]}"></span>${r}`).join("") +
+    `<span class="dot" style="background:transparent;border:2px solid #eb5757;width:11px;height:11px"></span>hunting you` +
+    `<span class="dot" style="background:#3ea6ff"></span>bot debug`;
+  buildFeed();
+  t = 0; resetView(); render();
+}
+
+function buildFeed() {
+  const hero = meta.hero_ids[0], el = $("feed");
+  el.innerHTML = "";
+  const rows = Object.entries(deadPos).sort((a, b) => a[1][2] - b[1][2]);
+  for (const [id, d] of rows) {
+    const div = document.createElement("div");
+    const by = d[3] >= 0 ? `#${d[3]}` : "zone";
+    const vc = ROLE_COLOR[meta.roles[id]], bc = d[3] >= 0 ? ROLE_COLOR[meta.roles[d[3]]] : "#8a93a3";
+    div.innerHTML = `<span class="ft">${fmt(d[2])}</span><b style="color:${bc}">${by}</b> → <b style="color:${vc}">#${id}</b>` +
+      (+id === hero ? " ☠" : (d[3] === hero ? " ✓" : ""));
+    div.onclick = () => { t = Math.max(0, d[2] - 3); playing = false; updatePlay(); render(); };
+    el.appendChild(div);
+  }
+}
+
+// ---------------------------------------------------------------- view transform
+function resize() {
+  const r = cv.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+  cv.width = Math.round(r.width * dpr); cv.height = Math.round(r.height * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  render();
+}
+function resetView() {
+  if (!meta) return;
+  const [x0, y0, x1, y1] = meta.bounds, r = cv.getBoundingClientRect();
+  view.cx = (x0 + x1) / 2; view.cy = (y0 + y1) / 2;
+  view.scale = Math.min(r.width / (x1 - x0), r.height / (y1 - y0)) * 0.96;
+  userMoved = false;
+}
+const W2S = (x, y) => { const r = cv.getBoundingClientRect();
+  return [r.width / 2 + (x - view.cx) * view.scale, r.height / 2 - (y - view.cy) * view.scale]; };
+const S2W = (sx, sy) => { const r = cv.getBoundingClientRect();
+  return [view.cx + (sx - r.width / 2) / view.scale, view.cy - (sy - r.height / 2) / view.scale]; };
+
+// ---------------------------------------------------------------- frame lookup + interpolation
+function frameIndex(tt) {
+  let lo = 0, hi = frames.length - 1;
+  while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (frames[mid].t <= tt) lo = mid; else hi = mid - 1; }
+  return lo;
+}
+function mechsAt(tt) {
+  const i = frameIndex(tt), a = frames[i], b = frames[Math.min(i + 1, frames.length - 1)];
+  const u = b.t > a.t ? Math.min(1, Math.max(0, (tt - a.t) / (b.t - a.t))) : 0;
+  const bm = new Map(b.m.map(m => [m[0], m]));
+  return a.m.map(m => {
+    const n = bm.get(m[0]);
+    if (!n) return m;
+    let dy = n[4] - m[4]; if (dy > Math.PI) dy -= 2 * Math.PI; if (dy < -Math.PI) dy += 2 * Math.PI;
+    return [m[0], m[1] + (n[1] - m[1]) * u, m[2] + (n[2] - m[2]) * u, m[3] + (n[3] - m[3]) * u, m[4] + dy * u,
+            m[5] + (n[5] - m[5]) * u, m[6], m[7], m[8], m[9], m[10]];
+  });
+}
+
+// ---------------------------------------------------------------- drawing
+function heightColor(top, kind) {
+  if (kind === "s") return "#4a3f63";
+  if (kind === "b") return "rgba(120,130,150,0.35)";
+  const h = Math.max(0, Math.min(1, (top + 5) / 75));
+  const l = 26 + h * 26;
+  return `hsl(215, 14%, ${l}%)`;
+}
+function poly(ring) {
+  ctx.beginPath();
+  for (let k = 0; k < ring.length; k += 2) {
+    const [sx, sy] = W2S(ring[k], ring[k + 1]);
+    if (k === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
+  }
+  ctx.closePath();
+}
+function circle(x, y, rWorld, minPx = 0) {
+  const [sx, sy] = W2S(x, y);
+  ctx.beginPath(); ctx.arc(sx, sy, Math.max(minPx, rWorld * view.scale), 0, Math.PI * 2);
+}
+function fmt(s) { const m = Math.floor(s / 60); return `${m}:${(s - m * 60).toFixed(1).padStart(4, "0")}`; }
+
+function render() {
+  if (!meta) return;
+  const r = cv.getBoundingClientRect();
+  const i = frameIndex(t), f = frames[i], ms = mechsAt(t);
+  if (follow !== null && $("follow").checked) {
+    const fm = ms.find(m => m[0] === follow);
+    if (fm) {
+      view.cx += (fm[1] - view.cx) * 0.25; view.cy += (fm[2] - view.cy) * 0.25;
+      if (!userMoved) view.scale = Math.max(view.scale, 1.6);
+    }
+  }
+  ctx.fillStyle = "#11141a"; ctx.fillRect(0, 0, r.width, r.height);
+  // map bounds
+  const [x0, y0, x1, y1] = meta.bounds;
+  const [ax, ay] = W2S(x0, y1), [bx, by] = W2S(x1, y0);
+  ctx.fillStyle = "#1a1f27"; ctx.fillRect(ax, ay, bx - ax, by - ay);
+  // buildings (low first so tall ones draw on top)
+  for (const b of buildings) {
+    poly(b.r); ctx.fillStyle = heightColor(b.t, b.k); ctx.fill();
+    ctx.strokeStyle = "rgba(0,0,0,0.35)"; ctx.lineWidth = 1; ctx.stroke();
+  }
+  // zone: tint outside, current ring, next ring
+  const z = f.z;
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0, 0, r.width, r.height);
+  { const [zx, zy] = W2S(z[0], z[1]); ctx.moveTo(zx + z[2] * view.scale, zy); ctx.arc(zx, zy, Math.max(0, z[2] * view.scale), 0, Math.PI * 2, true); }
+  ctx.fillStyle = "rgba(120,60,200,0.18)"; ctx.fill("evenodd"); ctx.restore();
+  circle(z[0], z[1], z[2]); ctx.strokeStyle = "#8b6cff"; ctx.lineWidth = 2; ctx.stroke();
+  ctx.setLineDash([6, 6]); circle(z[3], z[4], z[5]); ctx.strokeStyle = "rgba(255,255,255,0.55)"; ctx.lineWidth = 1.5; ctx.stroke(); ctx.setLineDash([]);
+  // loot: crates, cubes, weapon pickups, drops
+  for (const c of f.c || []) { const [sx, sy] = W2S(c[0], c[1]); ctx.fillStyle = "#8a6a3a"; ctx.fillRect(sx - 3, sy - 3, 6, 6); }
+  for (const c of f.q || []) { const [sx, sy] = W2S(c[0], c[1]); ctx.fillStyle = "#5ff2e0";
+    ctx.beginPath(); ctx.moveTo(sx, sy - 4); ctx.lineTo(sx + 4, sy); ctx.lineTo(sx, sy + 4); ctx.lineTo(sx - 4, sy); ctx.fill(); }
+  ctx.font = "bold 10px system-ui"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  for (const w of f.w || []) { const [sx, sy] = W2S(w[0], w[1]);
+    ctx.fillStyle = "rgba(0,0,0,0.6)"; ctx.fillRect(sx - 6, sy - 6, 12, 12);
+    ctx.fillStyle = WEAPON_COLOR[w[2]]; ctx.fillText(["G", "M", "L", "Z"][w[2]], sx, sy + 0.5); }
+  for (const d of f.d || []) { circle(d[0], d[1], 8, 5); ctx.strokeStyle = "#ffd24a"; ctx.lineWidth = 2; ctx.stroke();
+    if (showLabels) { const [sx, sy] = W2S(d[0], d[1]); ctx.fillStyle = "#ffd24a";
+      ctx.fillText(d[2] > 0 ? `drop ${d[2].toFixed(0)}s` : (d[3] !== null ? `capturing #${d[3]}` : "drop"), sx, sy - 14); } }
+  // death markers
+  for (const [id, d] of Object.entries(deadPos)) {
+    if (d[2] > t) continue;
+    const [sx, sy] = W2S(d[0], d[1]);
+    ctx.strokeStyle = ROLE_COLOR[meta.roles[id]]; ctx.globalAlpha = 0.7; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(sx - 5, sy - 5); ctx.lineTo(sx + 5, sy + 5); ctx.moveTo(sx + 5, sy - 5); ctx.lineTo(sx - 5, sy + 5); ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+  // effects from the last ~0.6 s
+  for (let k = Math.max(0, i - 6); k <= i; k++) {
+    const fx = frames[k].fx; if (!fx) continue;
+    const age = t - frames[k].t, a = Math.max(0, 1 - age / 0.6);
+    for (const e of fx) {
+      ctx.globalAlpha = a;
+      if (e[0] === "beam" || e[0] === "arc") {
+        const [sx, sy] = W2S(e[1], e[2]), [ex, ey] = W2S(e[3], e[4]);
+        ctx.strokeStyle = e[0] === "beam" ? "#ff4040" : "#6fd3ff"; ctx.lineWidth = e[0] === "beam" ? 3 : 2;
+        ctx.beginPath(); ctx.moveTo(sx, sy);
+        if (e[0] === "arc") { for (let s = 1; s < 6; s++) { const u = s / 6;
+          ctx.lineTo(sx + (ex - sx) * u + (Math.random() - .5) * 8, sy + (ey - sy) * u + (Math.random() - .5) * 8); } }
+        ctx.lineTo(ex, ey); ctx.stroke();
+      } else if (e[0] === "boom") {
+        circle(e[1], e[2], e[3] * (1.2 - a * 0.4), 6); ctx.fillStyle = "rgba(255,150,60,0.45)"; ctx.fill();
+      } else if (e[0] === "hit" && showLabels) {
+        const [sx, sy] = W2S(e[1], e[2]); ctx.fillStyle = "#ffe08a"; ctx.font = "bold 11px system-ui";
+        ctx.fillText(`-${e[3]}`, sx + 10, sy - 12 - age * 30);
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+  // projectiles
+  for (const p of f.p || []) { const [sx, sy] = W2S(p[0], p[1]);
+    ctx.fillStyle = p[2] ? "#ff9b3d" : "#ffe36e"; ctx.beginPath(); ctx.arc(sx, sy, p[2] ? 3.5 : 1.8, 0, Math.PI * 2); ctx.fill(); }
+  // hero debug drawing: path, goal, label (what the bot is thinking)
+  const heroId = meta.hero_ids[0];
+  if (showDebug && f.dbg) {
+    for (const [id, d] of Object.entries(f.dbg)) {
+      ctx.strokeStyle = "#3ea6ff"; ctx.lineWidth = 1.5;
+      for (const ln of d.lines || []) { const [a1, a2] = W2S(ln.a[0], ln.a[1]), [b1, b2] = W2S(ln.b[0], ln.b[1]);
+        ctx.strokeStyle = ln.color || "#3ea6ff"; ctx.beginPath(); ctx.moveTo(a1, a2); ctx.lineTo(b1, b2); ctx.stroke(); }
+      for (const pt of d.points || []) { const [sx, sy] = W2S(pt.at[0], pt.at[1]);
+        ctx.fillStyle = pt.color || "#3ea6ff"; ctx.beginPath(); ctx.arc(sx, sy, pt.size || 4, 0, Math.PI * 2); ctx.fill(); }
+    }
+  }
+  // mechs
+  for (const m of ms) {
+    const [id, x, y, zz, yaw, hp, mhp, cubes, w1, charging, hunting] = m;
+    const role = meta.roles[id], col = ROLE_COLOR[role] || "#ccc";
+    const rad = 2.5 * (1 + 0.05 * cubes);
+    const [sx, sy] = W2S(x, y), pr = Math.max(id === heroId ? 6 : 4.5, rad * view.scale);
+    // aim line
+    const al = Math.max(18, 14 * view.scale);
+    ctx.strokeStyle = charging ? "#ff4040" : col; ctx.lineWidth = charging ? 2.5 : 1.5; ctx.globalAlpha = 0.85;
+    ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(sx + Math.cos(yaw) * al, sy - Math.sin(yaw) * al); ctx.stroke();
+    // body
+    ctx.globalAlpha = 1; ctx.fillStyle = col; ctx.beginPath(); ctx.arc(sx, sy, pr, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = hunting ? "#eb5757" : "rgba(0,0,0,0.6)"; ctx.lineWidth = hunting ? 2.5 : 1.5;
+    if (hunting) { ctx.beginPath(); ctx.arc(sx, sy, pr + 3, 0, Math.PI * 2); ctx.stroke(); }
+    else ctx.stroke();
+    if (w1) { ctx.fillStyle = WEAPON_COLOR[w1]; ctx.beginPath(); ctx.arc(sx, sy, Math.max(2, pr * 0.4), 0, Math.PI * 2); ctx.fill(); }
+    // hp bar
+    const bw = 26, frac = Math.max(0, Math.min(1, hp / mhp));
+    ctx.fillStyle = "rgba(0,0,0,0.65)"; ctx.fillRect(sx - bw / 2, sy - pr - 9, bw, 4);
+    ctx.fillStyle = frac > 0.5 ? "#3ee07a" : frac > 0.25 ? "#f2c94c" : "#eb5757";
+    ctx.fillRect(sx - bw / 2, sy - pr - 9, bw * frac, 4);
+    if (showLabels) {
+      ctx.font = id === heroId ? "bold 11px system-ui" : "10px system-ui"; ctx.fillStyle = "#e8ecf2";
+      let lbl = `#${id}`;
+      if (id === heroId && f.mo && f.mo[id]) lbl += ` ${f.mo[id]}`;
+      if (zz > 2 && id === heroId) lbl += ` ↑${zz.toFixed(0)}m`;
+      ctx.fillText(lbl, sx, sy - pr - 17);
+    }
+  }
+  // HUD
+  const alive = ms.length, hero = ms.find(m => m[0] === heroId);
+  $("hud").innerHTML = `<b>${fmt(t)}</b> · ${alive} alive · zone r ${z[2].toFixed(0)} m → ${z[5].toFixed(0)} m` +
+    (hero ? `<br><span style="color:${ROLE_COLOR.hero}">hero #${heroId}</span>: ${hero[5].toFixed(0)}/${hero[6].toFixed(0)} hp · ` +
+      `${hero[7]} cubes · ${WEAPON[hero[8]] === "gun" ? "gun only" : "gun + " + WEAPON[hero[8]]}` +
+      (f.mo && f.mo[heroId] ? ` · <i>${f.mo[heroId]}</i>` : "") : `<br>hero dead`);
+  $("time").textContent = `${fmt(t)} / ${fmt(frames[frames.length - 1].t)}`;
+  $("scrub").value = Math.round(1000 * t / frames[frames.length - 1].t);
+  renderRoster(ms, f);
+}
+
+let rosterKey = "";
+function renderRoster(ms, f) {
+  const byId = new Map(ms.map(m => [m[0], m]));
+  const ids = Object.keys(meta.roles).map(Number).sort((a, b) => {
+    const ra = byId.has(a) ? 0 : 1, rb = byId.has(b) ? 0 : 1;
+    return ra - rb || (a === meta.hero_ids[0] ? -1 : b === meta.hero_ids[0] ? 1 : a - b);
+  });
+  let html = "";
+  for (const id of ids) {
+    const m = byId.get(id), role = meta.roles[id], dead = !m, d = deadPos[id];
+    const hpPct = m ? Math.max(0, 100 * m[5] / m[6]) : 0;
+    const status = dead ? (d ? `died ${fmt(d[2])}` : "") :
+      `<span class="hpbar"><i style="width:${hpPct}%;background:${hpPct > 50 ? "#3ee07a" : hpPct > 25 ? "#f2c94c" : "#eb5757"}"></i></span>`;
+    const mode = f.mo && f.mo[id] ? `<span class="mode">${f.mo[id]}</span>` : "";
+    html += `<tr class="row${dead ? " dead" : ""}${follow === id ? " sel" : ""}" data-id="${id}">` +
+      `<td><span class="sw" style="background:${ROLE_COLOR[role]}"></span> #${id}</td><td>${role}</td>` +
+      `<td>${status}</td><td>${m && m[8] ? WEAPON[m[8]] : ""}</td><td>${mode}</td></tr>`;
+  }
+  if (html !== rosterKey) { $("roster").innerHTML = html; rosterKey = html; }
+}
+$("roster").addEventListener("click", (e) => {
+  const tr = e.target.closest("tr.row"); if (!tr) return;
+  follow = +tr.dataset.id; $("follow").checked = true; userMoved = false; render();
+});
+
+// ---------------------------------------------------------------- playback + input
+let lastTs = null;
+function tick(ts) {
+  if (playing && meta) {
+    if (lastTs !== null) {
+      t += Math.min(0.25, (ts - lastTs) / 1000) * speed;
+      const end = frames[frames.length - 1].t;
+      if (t >= end) { t = end; playing = false; updatePlay(); }
+    }
+    render();
+  }
+  lastTs = ts;
+  requestAnimationFrame(tick);
+}
+function updatePlay() { $("play").textContent = playing ? "❚❚ Pause" : "▶ Play"; }
+$("play").onclick = () => { if (!meta) return; if (t >= frames[frames.length - 1].t) t = 0; playing = !playing; updatePlay(); };
+$("speed").onchange = (e) => { speed = +e.target.value; };
+$("scrub").oninput = (e) => { if (!meta) return; t = frames[frames.length - 1].t * e.target.value / 1000; render(); };
+$("debug").onchange = (e) => { showDebug = e.target.checked; render(); };
+$("labels").onchange = (e) => { showLabels = e.target.checked; render(); };
+$("follow").onchange = () => { userMoved = false; render(); };
+window.addEventListener("keydown", (e) => {
+  if (!meta || e.target.tagName === "INPUT" && e.target.type !== "checkbox" && e.target.type !== "range") return;
+  const end = frames[frames.length - 1].t;
+  if (e.code === "Space") { e.preventDefault(); $("play").click(); }
+  else if (e.key === "ArrowRight") { t = Math.min(end, t + 2); render(); }
+  else if (e.key === "ArrowLeft") { t = Math.max(0, t - 2); render(); }
+  else if (e.key === ".") { t = Math.min(end, t + 0.1); render(); }
+  else if (e.key === ",") { t = Math.max(0, t - 0.1); render(); }
+  else if (e.key === "f" || e.key === "F") { $("follow").checked = !$("follow").checked; render(); }
+  else if (e.key === "d" || e.key === "D") { $("debug").click(); }
+  else if (e.key >= "1" && e.key <= "6") { const s = $("speed"); s.selectedIndex = +e.key - 1; speed = +s.value; }
+});
+cv.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  const r = cv.getBoundingClientRect(), [wx, wy] = S2W(e.clientX - r.left, e.clientY - r.top);
+  view.scale *= Math.exp(-e.deltaY * 0.0015);
+  view.scale = Math.max(0.3, Math.min(40, view.scale));
+  if (!$("follow").checked) { const [nx, ny] = S2W(e.clientX - r.left, e.clientY - r.top); view.cx += wx - nx; view.cy += wy - ny; }
+  userMoved = true; render();
+}, { passive: false });
+let drag = null;
+cv.addEventListener("mousedown", (e) => { drag = [e.clientX, e.clientY]; cv.classList.add("dragging"); });
+window.addEventListener("mouseup", () => { drag = null; cv.classList.remove("dragging"); });
+window.addEventListener("mousemove", (e) => {
+  if (!drag) return;
+  view.cx -= (e.clientX - drag[0]) / view.scale; view.cy += (e.clientY - drag[1]) / view.scale;
+  drag = [e.clientX, e.clientY]; $("follow").checked = false; userMoved = true; render();
+});
+cv.addEventListener("dblclick", () => { resetView(); render(); });
+// drag-and-drop a replay .json (or .html produced by replay.py)
+const dropEl = $("drop");
+window.addEventListener("dragover", (e) => { e.preventDefault(); dropEl.classList.add("show"); });
+window.addEventListener("dragleave", (e) => { if (e.target === dropEl) dropEl.classList.remove("show"); });
+window.addEventListener("drop", async (e) => {
+  e.preventDefault(); dropEl.classList.remove("show");
+  const file = e.dataTransfer.files[0]; if (!file) return;
+  let txt = await file.text();
+  const m = txt.match(/let DATA = (\{.*\});\s*$/m);
+  load(JSON.parse(m ? m[1] : txt));
+});
+window.addEventListener("resize", resize);
+resize();
+if (DATA) load(DATA); else dropEl.classList.add("show");
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>

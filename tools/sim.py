@@ -136,6 +136,7 @@ class Sim:
         self.squad_ff = friendly_fire_team
         self.hunters = set()
         self.omniscient = False
+        self.recorder = None  # optional callable(sim) after every decision (tools/replay.py)
         self._zone_init()
         self.mechs: List[Mech] = []
         spawns = self._spawns(len(bots))
@@ -868,6 +869,8 @@ class Sim:
                         traceback.print_exc()
                     a = {"move": m.cmd["move"], "aim": m.cmd["aim"], "boost": m.cmd["boost"]}
                 m.act_ms.append((time.perf_counter() - s) * 1000)
+                m.last_debug = a.get("debug") or mf.draw.take()  # what the bot drew this decision
+                m.last_action = a
                 self.apply_action(m, a)
             for _ in range(int(self.cfg["match"]["decide_every"])):
                 for m in self.mechs:
@@ -878,6 +881,8 @@ class Sim:
                 self.world_tick()
                 self.t += DT
                 self.tick += 1
+            if self.recorder is not None:
+                self.recorder(self)
         # placement: survivors ranked by hp
         alive = sorted([m for m in self.mechs if m.alive], key=lambda m: -m.hp)
         for i, m in enumerate(alive):
