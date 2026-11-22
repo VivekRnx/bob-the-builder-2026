@@ -102,7 +102,7 @@ TUNING = {
     "laser_hold": False,          # keep a charge through a short LOS loss instead of firing into cover
     "lightning_cone_mult": 0.8,
     "bullet_dodge": True,         # step out of the line of visible enemy bullets (house bots aim exactly)
-    "rng_salt": 0,                # re-roll our random choices (strafe timing etc.) without changing policy
+    "rng_salt": 7,                # re-roll our random choices (strafe timing etc.) without changing policy
     "ffa_lock_s": 0.0,            # no unexplained death by this time -> practice for sure, never switch (0 = off)
     "laser_carrier_bonus": 0.0,   # without a laser: prefer targets carrying one (a kill drops their laser)
     "open_scan_s": 0.0,           # first N s: jet up and spin to spot weapons over buildings (0 = off)
