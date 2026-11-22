@@ -1,0 +1,191 @@
+{
+ "lose_rule": {
+  "lose_rule": true
+ },
+ "target_giddy": {
+  "target_giddy": true
+ },
+ "fight_scorer": {
+  "fight_scorer": true
+ },
+ "fight_loot": {
+  "fight_loot": true
+ },
+ "item_memory": {
+  "item_memory": true
+ },
+ "zone_deadline": {
+  "zone_deadline": true
+ },
+ "aim_lat": {
+  "aim_lat": 0.075
+ },
+ "slew_fire": {
+  "slew_fire": true
+ },
+ "shared_barrel": {
+  "shared_barrel": true
+ },
+ "laser_hold": {
+  "laser_hold": true
+ },
+ "lightning_narrow": {
+  "lightning_cone_mult": 0.5
+ },
+ "giddy_fight_bundle": {
+  "lose_rule": true,
+  "target_giddy": true,
+  "fight_scorer": true,
+  "fight_loot": true,
+  "chase": true
+ },
+ "giddy_aim_bundle": {
+  "aim_lat": 0.075,
+  "slew_fire": true,
+  "shared_barrel": true,
+  "laser_hold": true
+ },
+ "upg_giddy_squad": {
+  "upgrade_priority": [
+   "plating",
+   "armor",
+   "laser_damage",
+   "laser_charge",
+   "nanites",
+   "gun_damage",
+   "gun_rate",
+   "lightning_efficiency",
+   "lightning_range",
+   "servos",
+   "gun_mag",
+   "gun_velocity",
+   "gyros",
+   "sensors",
+   "reactor",
+   "capacitor",
+   "jets",
+   "mortar_reload",
+   "mortar_splash",
+   "mortar_velocity",
+   "lightning_chain",
+   "laser_pierce"
+  ]
+ },
+ "finish_38": {
+  "finish_hp_frac": 0.38
+ },
+ "chase_on": {
+  "chase": true
+ },
+ "ranges_top": {
+  "fight_range": {
+   "gun": 85.0,
+   "laser": 120.0,
+   "mortar": 90.0,
+   "lightning": 28.0
+  }
+ },
+ "reengage_80": {
+  "reengage_hp_frac": 0.8
+ },
+ "strafe_fast": {
+  "strafe_period": [
+   0.3,
+   1.0
+  ]
+ },
+ "upg_laser_first": {
+  "upgrade_priority": [
+   "plating",
+   "armor",
+   "laser_damage",
+   "laser_charge",
+   "gun_damage",
+   "gun_rate",
+   "nanites",
+   "gyros",
+   "lightning_efficiency",
+   "gun_mag",
+   "gun_velocity",
+   "servos",
+   "sensors",
+   "reactor",
+   "capacitor",
+   "jets",
+   "mortar_reload",
+   "mortar_splash",
+   "mortar_velocity",
+   "lightning_range",
+   "lightning_chain",
+   "laser_pierce"
+  ]
+ },
+ "upg_automata": {
+  "upgrade_priority": [
+   "plating",
+   "armor",
+   "nanites",
+   "gun_damage",
+   "gun_rate",
+   "laser_damage",
+   "laser_charge",
+   "gyros",
+   "lightning_efficiency",
+   "gun_mag",
+   "gun_velocity",
+   "servos",
+   "sensors",
+   "reactor",
+   "capacitor",
+   "jets",
+   "mortar_reload",
+   "mortar_splash",
+   "mortar_velocity",
+   "lightning_range",
+   "lightning_chain",
+   "laser_pierce"
+  ]
+ },
+ "loot_150": {
+  "loot_radius": 150.0,
+  "crate_radius": 120.0
+ },
+ "drones_50": {
+  "npc_farm_min_hp_frac": 0.5
+ },
+ "quiet_practice": {
+  "quiet_walk": true
+ },
+ "bullet_dodge": {
+  "bullet_dodge": true
+ },
+ "ffa_lock_45": {
+  "ffa_lock_s": 45.0
+ },
+ "laser_carrier_60": {
+  "laser_carrier_bonus": 60.0
+ },
+ "open_scan_mem": {
+  "open_scan_s": 3.0,
+  "item_memory": true
+ },
+ "strafe_slow": {
+  "strafe_period": [
+   3.0,
+   5.0
+  ]
+ },
+ "snipe_laser_170": {
+  "fight_range": {
+   "gun": 46.1,
+   "laser": 170.0,
+   "mortar": 60.0,
+   "lightning": 31.3
+  },
+  "scorer_laser_range": 170.0
+ },
+ "critical_recovery": {
+  "cover_hp_frac": 0.25,
+  "reengage_hp_frac": 0.6
+ }
+}

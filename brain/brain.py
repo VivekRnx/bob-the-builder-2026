@@ -89,6 +89,24 @@ TUNING = {
     "ffa_engage_only_forced": False,
     "ffa_detect_ticks": 5,        # unexplained deaths seen this many ticks in a row -> it's a free-for-all
     "ffa_min_deaths": 2,          # ...at least this many of them
+    # ---- practice-mode techniques from giddy / Kanyaraasi / automata (all gated; off = old behaviour) ----
+    "lose_rule": False,           # giddy LoseRule: retreat only while losing (1.5 s latch), no hide-to-85%
+    "target_giddy": False,        # giddy target eligibility (LOS, forced/weak/closing/aimed) + d + 0.18*HP score
+    "fight_scorer": False,        # giddy fight-point scorer: 16 spots, LOS when a weapon is ready, sightlines, zone
+    "fight_loot": False,          # grab cubes within 70 m (40 m when hurt) mid-fight
+    "item_memory": False,         # remember pickups/cubes that left view
+    "zone_deadline": False,       # zone timing from the moving boundary (giddy), not shrink_end
+    "aim_lat": 0.0,               # gun lead latency (s); giddy 0.075, also compensates our own motion
+    "slew_fire": False,           # fire when the remaining turn fits in one tick
+    "shared_barrel": False,       # keep the gun's lead aim until the laser is 45% charged
+    "laser_hold": False,          # keep a charge through a short LOS loss instead of firing into cover
+    "lightning_cone_mult": 0.8,
+    "bullet_dodge": True,         # step out of the line of visible enemy bullets (house bots aim exactly)
+    "rng_salt": 0,                # re-roll our random choices (strafe timing etc.) without changing policy
+    "ffa_lock_s": 0.0,            # no unexplained death by this time -> practice for sure, never switch (0 = off)
+    "laser_carrier_bonus": 0.0,   # without a laser: prefer targets carrying one (a kill drops their laser)
+    "open_scan_s": 0.0,           # first N s: jet up and spin to spot weapons over buildings (0 = off)
+    "scorer_laser_range": 120.0,  # fight_scorer preferred range with a laser (Koodsu snipes at 170)   # lightning fires within this * cone_deg (giddy: 0.5 - 0.05 rad)
     "debug": True,
 }
 
@@ -155,7 +173,7 @@ class Brain:
         self.T.update(self.params)
         self.cfg = hello["config"]
         self.me_id = int(hello["slot"])
-        self.rng = random.Random(hello["seed"])
+        self.rng = random.Random(int(hello["seed"]) + 1000003 * int(self.T.get("rng_salt", 0)))
         t0 = time.perf_counter()
         self.world: Optional[World] = load_world(hello.get("map", {}).get("dir"))
         mech = self.cfg["mech"]
@@ -209,6 +227,11 @@ class Brain:
         self.unexplained_ticks = 0
         self.attacked_by: Dict[int, float] = {}  # mech id -> last time it damaged us
         self.kill_sites: List[Tuple[float, float, float]] = []  # (x, y, t)
+        self.lose_at = -99.0
+        self.squad_locked = False
+        self.item_mem: Dict[int, dict] = {}   # id -> {"cat": "pickup"|"cube", "kind", "pos", "seen"}
+        self.zone_hold: Optional[Tuple[List[float], float]] = None  # circle at shrink start
+        self.laser_lost_t: Optional[float] = None
 
     # ================================================================== main
     def act(self, obs: mf.Observation) -> mf.Action:
@@ -242,6 +265,13 @@ class Brain:
         if dodge is not None:
             move, boost = dodge
             self.mode = mode = mode + "+dodge"
+        elif self.T["bullet_dodge"]:
+            bd = self.bullet_dodge(obs)
+            if bd is not None:
+                mx, my = move[0] * 0.4 + bd[0] * 0.9, move[1] * 0.4 + bd[1] * 0.9
+                n = math.hypot(mx, my) or 1.0
+                move = [round(mx / n, 3), round(my / n, 3)]
+                self.mode = mode = mode + "+bullet"
         if not me["grounded"] and t >= self.unstick_until and not mode.startswith("zone!") and not self.climbing:
             boost = False  # boost in the air = jets: only on purpose
         # Quiet travel: under sound.step_speed nobody hears our steps (13 of 16 bots in real FFA replays do this).
@@ -252,6 +282,13 @@ class Brain:
             if n > q:
                 move = [round(move[0] * q / n, 3), round(move[1] * q / n, 3)]
         aim, fire, reload = self.combat(obs, enemy, farm)
+        if t < self.T["open_scan_s"] and enemy is None and not self.threat:
+            # opening scan: rise on the jets and spin, so weapons behind buildings show up (and get remembered)
+            aim = [wrap(me["aim"][0] + 1.5), 0.0]
+            move = [0.0, 0.0]
+            jump = me["grounded"]
+            boost = (not me["grounded"]) and me["energy"] > 45
+            self.mode = mode = "scan"
         if mode.startswith("cover") and enemy is not None and not self.has_los_to(me, enemy):
             fire = [False, False]  # don't give away the hide; let regen start
 
@@ -361,12 +398,19 @@ class Brain:
             self.unexplained_ticks += 1
         else:
             self.unexplained_ticks = 0
-        if not self.ffa and self.unexplained_ticks >= self.T["ffa_detect_ticks"]:
+        if self.T["ffa_lock_s"] > 0 and not self.ffa and t > self.T["ffa_lock_s"]:
+            self.squad_locked = True
+        if not self.ffa and not self.squad_locked and self.unexplained_ticks >= self.T["ffa_detect_ticks"]:
             self.ffa = True
             self.T.update(FFA_OVERRIDES)
             self.T.update(self.params.get("ffa", {}) if isinstance(self.params.get("ffa"), dict) else {})
             mf.log(f"t={t:.1f} free-for-all detected: switching to survival play")
         self.kill_sites = [k for k in self.kill_sites if t - k[2] < self.T["killsite_s"]]
+        if self.T["item_memory"]:
+            self.update_item_memory(obs)
+        z = obs["zone"]
+        if t <= z.get("shrink_start", 0) or self.zone_hold is None:
+            self.zone_hold = (list(z["center"]), float(z["radius"]))
         # sounds that matter (weapons/steps), kept 2 s
         for s in obs.get("sounds", []):
             if s["kind"] in ("gun", "laser", "laser_charge", "mortar", "lightning", "step", "boost", "jet") \
@@ -390,6 +434,61 @@ class Brain:
                 self.path_t = -99
         else:
             self.stuck_since = None
+
+    def update_item_memory(self, obs) -> None:
+        """Remember weapons and cubes after they leave view (the server lists them only while seen).
+        Forget one when we're close (< 40 m), it has been unseen for 0.35 s and nothing blocks the view."""
+        t, me = obs["t"], obs["self"]
+        p = me["pos"]
+        mem = self.item_mem
+        now = set()
+        for cat, lst in (("pickup", obs["pickups"]), ("cube", obs["cubes"])):
+            for it in lst:
+                i = int(it["id"])
+                now.add(i)
+                mem[i] = {"cat": cat, "kind": it.get("kind", "cube"), "pos": list(it["pos"]), "seen": t, "id": i}
+        eye = (p[0], p[1], p[2] + me["stats"].get("eye_height", 8.0))
+        checks = 0
+        for i in list(mem):
+            if i in now:
+                continue
+            it = mem[i]
+            q = it["pos"]
+            d = hdist(p, q)
+            if t - it["seen"] > 150 or (int(i) in self.bad_pickups and t - self.bad_pickups[int(i)] < 1):
+                del mem[i]
+            elif d < 3.0:
+                del mem[i]  # we're on it and it isn't listed: taken
+            elif d < 40 and t - it["seen"] > 0.35 and checks < 20:
+                checks += 1
+                if self.world is None or self.world.los(eye, (q[0], q[1], q[2] + 1.5), skip_start=0):
+                    del mem[i]
+
+    def pickups_known(self, obs) -> List[dict]:
+        if not self.T["item_memory"]:
+            return obs["pickups"]
+        return [it for it in self.item_mem.values() if it["cat"] == "pickup"]
+
+    def cubes_known(self, obs) -> List[dict]:
+        if not self.T["item_memory"]:
+            return obs["cubes"]
+        return [it for it in self.item_mem.values() if it["cat"] == "cube"]
+
+    def late_game(self, obs) -> bool:
+        return obs["zone"]["next_radius"] <= 70 or self.alive <= 3
+
+    def zone_pen(self, obs, c) -> float:
+        """giddy's zone penalty for standing at c"""
+        z, t = obs["zone"], obs["t"]
+        pen = 0.0
+        dc = hdist(c, z["center"]) - z["radius"]
+        if dc > -5:
+            pen += 150 + 5 * (dc + 5)
+        dn = hdist(c, z["next_center"]) - z["next_radius"]
+        if dn > -5:
+            soon = max(0.1, min(1.0, 1 - (z.get("shrink_start", t) - t) / 25.0))
+            pen += soon * (25 + 0.8 * (dn + 5))
+        return pen
 
     def unseen_attacker(self, obs) -> Optional[int]:
         if not self.threat or obs["t"] - self.threat[1] > 1.2 or self.threat[2] is None:
@@ -415,6 +514,8 @@ class Brain:
 
     def pick_enemy(self, obs: mf.Observation) -> Optional[Track]:
         """Best mech to engage: reported by the server now (it tracks real positions 5 s after view)."""
+        if self.T["target_giddy"] and not self.ffa:
+            return self.pick_enemy_giddy(obs)
         me = obs["self"]
         best, best_score = None, 1e9
         cur_score = None
@@ -439,6 +540,8 @@ class Brain:
                 score -= self.T["tgt_attacker_bonus"]  # whoever is shooting us
             if tr.charging and self.aimed_at_me(tr, me):
                 score -= self.T["tgt_charging_bonus"]
+            if not have_laser and "laser" in tr.weapons:
+                score -= self.T["laser_carrier_bonus"]
             if d > 240:
                 score += 200
             if tr.id == self.target_id:
@@ -447,6 +550,49 @@ class Brain:
                 best, best_score = tr, score
         if cur_score is not None and cur_score < best_score + self.T["tgt_sticky"]:
             best = self.tracks[self.target_id]  # stick with the current target unless clearly worse
+        self.target_id = best.id if best else None
+        return best
+
+    def pick_enemy_giddy(self, obs) -> Optional[Track]:
+        """giddy's squad targeting: only mechs we can see and hit, and only when the fight is forced, the
+        target is weak, closing on us or aiming at us. Score d + 0.18*HP (absolute) with big bonuses for
+        low HP and for the current target, so fire concentrates and kills (and their cubes) come fast."""
+        me, t = obs["self"], obs["t"]
+        p, v = me["pos"], me["vel"]
+        late = self.late_game(obs)
+        muzzle = (p[0], p[1], p[2] + me["stats"].get("muzzle_height", 7))
+        best, bs = None, 1e18
+        for m in self.visible_enemies(obs):
+            tr = self.tracks[m["id"]]
+            d = max(1.0, hdist(p, tr.pos))
+            if d > 240:
+                continue
+            if self.world is not None:
+                hgt = 9.0 * (1 + 0.05 * tr.cubes)
+                if not (self.world.los(muzzle, (tr.pos[0], tr.pos[1], tr.pos[2] + hgt * 0.5)) or
+                        self.world.los(muzzle, (tr.pos[0], tr.pos[1], tr.pos[2] + hgt * 0.85))):
+                    continue
+            dx, dy = tr.pos[0] - p[0], tr.pos[1] - p[1]
+            closing = -((tr.vel[0] - v[0]) * dx + (tr.vel[1] - v[1]) * dy) / d
+            aimed = abs(wrap(tr.aim[0] - yaw_to(tr.pos, p))) < 0.22
+            hit_me = t - self.attacked_by.get(tr.id, -99.0)
+            mx = max(1.0, tr.max_hp)
+            if not (d < 60 or hit_me < 6 or late or (closing > 3 and d < 180) or (tr.hp < 0.4 * mx and d < 160)
+                    or (aimed and d < 190)):
+                continue
+            s = d + 0.18 * tr.hp
+            if tr.hp <= 0.3 * mx:
+                s -= 200
+            if tr.id == self.target_id:
+                s -= 200
+            if hit_me < 4:
+                s -= 40
+            if closing > 3:
+                s -= 15
+            if "laser" in tr.weapons and not any(w and w["kind"] == "laser" for w in me["weapons"]):
+                s -= self.T["laser_carrier_bonus"]
+            if s < bs:
+                best, bs = tr, s
         self.target_id = best.id if best else None
         return best
 
@@ -502,7 +648,7 @@ class Brain:
             return None
         p = me["pos"]
         best, bd = None, radius
-        for pk in obs["pickups"]:
+        for pk in self.pickups_known(obs):
             if pk["kind"] != "laser" or not self.goal_ok(pk["pos"]) or abs(pk["pos"][2] - p[2]) > 6:
                 continue
             if int(pk["id"]) in self.bad_pickups and t - self.bad_pickups[int(pk["id"])] < 5:
@@ -574,6 +720,8 @@ class Brain:
     # ================================================================== goals
     def zone_status(self, obs: mf.Observation) -> Tuple[Optional[List[float]], bool]:
         """(point to head for or None, urgent?)"""
+        if self.T["zone_deadline"]:
+            return self.zone_status_giddy(obs)
         me, z, t = obs["self"], obs["zone"], obs["t"]
         p = me["pos"]
         walk = me["stats"].get("walk_speed", 11.7) * 0.8  # paths aren't straight
@@ -590,6 +738,46 @@ class Brain:
             return [nc[0], nc[1]], urgent
         yaw = yaw_to(nc, p)
         return [nc[0] + math.cos(yaw) * inner, nc[1] + math.sin(yaw) * inner], urgent
+
+    def zone_deadline(self, obs, pt, pad: float) -> float:
+        """First time the moving zone edge passes within pad of pt (inf if pt stays inside the next circle)."""
+        z = obs["zone"]
+        nc, nr = z["next_center"], z["next_radius"]
+        if hdist(pt, nc) <= nr - pad:
+            return 1e9
+        hc, hr = self.zone_hold or (z["center"], z["radius"])
+        ss, se = z.get("shrink_start", obs["t"]), z["shrink_end"]
+        for k in range(25):
+            T = ss + (se - ss) * k / 24.0
+            f = 0.0 if se <= ss else max(0.0, min(1.0, (T - ss) / (se - ss)))
+            cx, cy = hc[0] + (nc[0] - hc[0]) * f, hc[1] + (nc[1] - hc[1]) * f
+            R = hr + (nr - hr) * f
+            if math.hypot(pt[0] - cx, pt[1] - cy) > R - pad:
+                return T
+        return se
+
+    def zone_status_giddy(self, obs):
+        me, z, t = obs["self"], obs["zone"], obs["t"]
+        p = me["pos"]
+        walk = me["stats"].get("walk_speed", 11.7)
+        nc, nr = z["next_center"], z["next_radius"]
+        margin = max(3.0, min(30.0, 0.3 * nr))
+        rr = max(0.0, nr - margin - 5)
+        dn = hdist(p, nc)
+        if nr <= 30:
+            goal = [nc[0], nc[1]]
+        elif dn <= rr:
+            return None, not me["in_zone"]
+        else:
+            yaw = yaw_to(nc, p)
+            goal = [nc[0] + math.cos(yaw) * rr, nc[1] + math.sin(yaw) * rr]
+        need = hdist(p, goal) * 1.45 / walk + 4
+        dl = self.zone_deadline(obs, p, 8.0)
+        must = (not me["in_zone"]) or t + need + 3 >= dl
+        should = t + need + 14 >= dl
+        if not (must or should):
+            return None, False
+        return goal, must
 
     def in_next_circle(self, obs, pt, margin=0.0) -> bool:
         z = obs["zone"]
@@ -631,6 +819,8 @@ class Brain:
         if want_cover and enemy is not None and n_att <= 1 and t - enemy.seen_t < 0.5 and \
                 enemy.hp < self.T["finish_ratio"] * me["hp"] and len([tr for tr in threats if t - tr.seen_t < 3.0]) <= 1:
             want_cover = False
+        if self.T["lose_rule"] and not self.ffa:
+            want_cover = self.losing_giddy(obs, enemy, hp_frac)
         if want_cover and threats:
             cv = self.find_cover(obs, threats)
             if cv is not None:
@@ -650,6 +840,13 @@ class Brain:
             return lz["pos"], False, "loot:laser", enemy is not None and hdist(p, lz["pos"]) < 4.0
 
         if enemy is not None:
+            if self.T["fight_loot"] and not self.ffa:
+                # cubes mid-fight (giddy FightLoot): +4% HP/damage each, and denied to the hunters
+                r = 70.0 if hp_frac > 0.5 else 40.0
+                cb = min((c for c in self.cubes_known(obs) if hdist(p, c["pos"]) < r and abs(c["pos"][2] - p[2]) < 4),
+                         key=lambda c: hdist(p, c["pos"]), default=None)
+                if cb is not None:
+                    return cb["pos"], False, "fight-cube", False
             return None, False, "fight", True
 
         # an attacker we can't see: turn to it (combat) and keep moving sideways
@@ -674,7 +871,7 @@ class Brain:
             # Not fully safe, but grab cubes close by (e.g. a kill's drop) if no enemy is near them.
             near = [tr for tr in threats if t - tr.seen_t < 3.0]
             best, bd = None, 40.0
-            for c in (obs["cubes"] if self.wants_cube(me) else []):
+            for c in (self.cubes_known(obs) if self.wants_cube(me) else []):
                 d = hdist(p, c["pos"])
                 if d < bd and abs(c["pos"][2] - p[2]) < 6 and self.goal_ok(c["pos"]) and \
                         all(hdist(tr.pos, c["pos"]) > 60 for tr in near):
@@ -684,7 +881,7 @@ class Brain:
         if safe or not threats:
             # better weapon nearby
             best, bd = None, self.T["loot_radius"]
-            for pk in obs["pickups"]:
+            for pk in self.pickups_known(obs):
                 if int(pk["id"]) in self.bad_pickups and t - self.bad_pickups[int(pk["id"])] < 5:
                     continue
                 if abs(pk["pos"][2] - p[2]) > 6 or not self.goal_ok(pk["pos"]):
@@ -695,7 +892,7 @@ class Brain:
             if best:
                 return best["pos"], False, f"loot:{best['kind']}", False
             best, bd = None, self.T["cube_radius"] * (self.T["early_farm_mult"] if t < self.T["early_farm_s"] else 1.0)
-            for c in (obs["cubes"] if self.wants_cube(me) else []):
+            for c in (self.cubes_known(obs) if self.wants_cube(me) else []):
                 d = hdist(p, c["pos"])
                 if d < bd and abs(c["pos"][2] - p[2]) < 6 and self.goal_ok(c["pos"]):
                     best, bd = c, d
@@ -746,6 +943,25 @@ class Brain:
         if hdist(p, z["next_center"]) > z["next_radius"] * 0.35:
             return list(z["next_center"]), False, "drift", False
         return None, False, "hold", False
+
+    def losing_giddy(self, obs, enemy: Optional[Track], hp_frac: float) -> bool:
+        """giddy LoseRule: retreat for 1.5 s after any tick we're losing; never while finishing or late."""
+        me, t = obs["self"], obs["t"]
+        p = me["pos"]
+        vis = [self.tracks[m["id"]] for m in self.visible_enemies(obs)]
+        near = sum(1 for tr in vis if hdist(tr.pos, p) < 160)
+        losing = (near >= 2 and hp_frac < 0.55) or (near >= 3 and hp_frac < 0.8)
+        if enemy is not None:
+            tf = enemy.hp / max(1.0, enemy.max_hp)
+            if hp_frac < 0.35 and tf > hp_frac + 0.1:
+                losing = True
+            if tf < 0.25 and hp_frac > 0.2 and near <= 2:
+                losing = False
+        if losing:
+            self.lose_at = t
+        retreat = t - self.lose_at < 1.5
+        finishing = enemy is not None and hdist(p, enemy.pos) < 120 and (enemy.hp < 200 or enemy.hp < 0.5 * me["hp"])
+        return retreat and not finishing and not self.late_game(obs)
 
     def find_cover(self, obs, threats: List[Track]) -> Optional[Tuple[float, float]]:
         """Nearby walkable spot with no line of sight from the closest threats. Cached ~0.6 s."""
@@ -956,6 +1172,8 @@ class Brain:
 
     def fight_move(self, obs, enemy: Track, retreat: bool = False):
         """Keep a weapon-appropriate range, juke sideways unpredictably, back off when losing."""
+        if self.T["fight_scorer"] and not retreat and not self.ffa and self.world is not None and self.time_ok():
+            return self.fight_move_giddy(obs, enemy)
         me = obs["self"]
         p, t = me["pos"], obs["t"]
         self.update_strafe(t)
@@ -993,6 +1211,126 @@ class Brain:
         y = self.steer(p, y, me, look=6.0)
         boost = ((retreat or d < 30) and me["energy"] > self.T["boost_min_energy"]) or             me["energy"] > self.T["fight_boost_energy"]
         return unit(y), boost
+
+    def fight_move_giddy(self, obs, enemy: Track):
+        """giddy's fight-point scorer: of 'stay' + 16 spots 6 m away, take the one that best keeps our
+        weapon's range, has line of sight to the target only when a weapon is ready (else ducks), isn't
+        seen by other enemies, stays in the zone and drifts toward nearby cubes."""
+        me, t = obs["self"], obs["t"]
+        p = me["pos"]
+        st = me["stats"]
+        w = self.world
+        self.update_strafe(t)
+        held = {x["kind"]: x for x in me["weapons"] if x}
+        light = "lightning" in held and me["energy"] > 12
+        rp = 85.0
+        if light:
+            rp = 28.0
+        elif "laser" in held:
+            rp = self.T["scorer_laser_range"]
+        if "lightning" not in held:
+            if "lightning" in enemy.weapons:
+                rp = max(rp, 64.0)
+            if "mortar" in enemy.weapons:
+                rp = max(rp, 80.0)
+        vis = [self.tracks[m["id"]] for m in self.visible_enemies(obs)]
+        crowd = sum(1 for tr in vis if hdist(tr.pos, p) < 160)
+        hp_frac = me["hp"] / me["max_hp"]
+        if enemy.hp < 0.38 * max(1.0, enemy.max_hp) and hp_frac > 0.42 and crowd <= 2:
+            rp = 20.0  # finish: close in
+        d0 = hdist(p, enemy.pos)
+        g = held.get("gun")
+        gun_ready = g is not None and g.get("ammo", 1) > 0 and g.get("reload", 0) <= 0.25 and \
+            d0 <= g["stats"].get("range", 230) - 10
+        want_los = 1.0 if (gun_ready or "laser" in held or light) else -1.0
+        eh = 9.0 * (1 + 0.05 * enemy.cubes)
+        tgt_c = (enemy.pos[0], enemy.pos[1], enemy.pos[2] + eh * 0.5)
+        to = yaw_to(p, enemy.pos)
+        sdir = (math.cos(to + math.pi / 2) * self.strafe, math.sin(to + math.pi / 2) * self.strafe)
+        others = [tr for tr in vis if tr.id != enemy.id]
+        cubes = [c for c in self.cubes_known(obs) if hdist(p, c["pos"]) < 40 and abs(c["pos"][2] - p[2]) < 4]
+        cube = min(cubes, key=lambda c: hdist(p, c["pos"]), default=None)
+        mh = st.get("muzzle_height", 7.0)
+        h = st.get("height", 9.0)
+        best, bs = None, -1e18
+        for k in range(17):
+            if k > 0 and not self.time_ok():
+                break
+            if k == 0:
+                c, r, dirv = (p[0], p[1]), 0.0, (0.0, 0.0)
+            else:
+                yaw = (k - 1) * math.pi / 8
+                dirv = (math.cos(yaw), math.sin(yaw))
+                r = 6.0
+                c = (p[0] + dirv[0] * r, p[1] + dirv[1] * r)
+                if self.nav is not None and not self.nav.is_free(*self.nav.cell_of(*c)):
+                    continue
+                if w.probe(p[0], p[1], p[2], yaw, r, self.step_up, h, self.max_slope, radius=self.rad) < r - 0.3:
+                    continue
+            gz = w.floor_under(c[0], c[1], p[2], self.step_up) if r > 0 else p[2]
+            s = -1.1 * abs(hdist(c, enemy.pos) - rp) - 0.4 * r
+            los = w.los((c[0], c[1], gz + mh), tgt_c)
+            if los:
+                s += 45 * want_los
+            for e in others:
+                if hdist(c, e.pos) < 170 and w.los((e.pos[0], e.pos[1], e.pos[2] + 8 * (1 + 0.05 * e.cubes)),
+                                                   (c[0], c[1], gz + 0.6 * h)):
+                    s -= 30
+            s -= self.zone_pen(obs, c)
+            if cube is not None:
+                s += 1.5 * (hdist(p, cube["pos"]) - hdist(c, cube["pos"]))
+            if r > 0 and want_los > 0:
+                s += 9 * (dirv[0] * sdir[0] + dirv[1] * sdir[1])
+            if r == 0:
+                s -= 8
+                if want_los < 0 and not los:
+                    s += 14
+            if s > bs:
+                best, bs = dirv, s
+        if best is None:
+            best = (0.0, 0.0)
+        boost = light and d0 > 50 and me["energy"] > 55 and want_los > 0
+        return best, boost
+
+    def bullet_dodge(self, obs) -> Optional[Tuple[float, float]]:
+        """Direction that steps out of the line of incoming bullets (gun + drone) arriving within 0.8 s."""
+        me = obs["self"]
+        p = me["pos"]
+        h = me["stats"].get("height", 9.0)
+        c = (p[0], p[1], p[2] + 0.56 * h)
+        R = self.rad + 1.1
+        ax = ay = 0.0
+        for pr in obs.get("projectiles", []):
+            if pr["kind"] == "mortar":
+                continue
+            v = pr["vel"]
+            vv = v[0] * v[0] + v[1] * v[1] + v[2] * v[2]
+            if vv < 1.0:
+                continue
+            q = pr["pos"]
+            rel = (c[0] - q[0], c[1] - q[1], c[2] - q[2])
+            tc = (rel[0] * v[0] + rel[1] * v[1] + rel[2] * v[2]) / vv
+            if tc <= 0 or tc > 0.8:
+                continue
+            mx, my, mz = rel[0] - v[0] * tc, rel[1] - v[1] * tc, rel[2] - v[2] * tc
+            if abs(mz) > h / 2 + 1.0:
+                continue
+            mxy = math.hypot(mx, my)
+            if mxy >= R:
+                continue
+            nv = math.hypot(v[0], v[1]) or 1.0
+            px, py = -v[1] / nv, v[0] / nv
+            if mxy > 0.3:
+                if px * mx + py * my < 0:
+                    px, py = -px, -py
+            elif self.strafe < 0:
+                px, py = -px, -py
+            wgt = (R - mxy) / R
+            ax += px * wgt
+            ay += py * wgt
+        if ax == 0 and ay == 0:
+            return None
+        return unit(self.steer(p, math.atan2(ay, ax), me, look=6.0))
 
     def dodge(self, obs):
         """Sidestep a laser aimed at us or get out of a mortar shell's splash. -> (move, boost) or None."""
@@ -1071,10 +1409,24 @@ class Brain:
         gun_slot = next((i for i, w in enumerate(weapons) if w and w["kind"] == "gun"), None)
         if gun_slot is not None:
             g = weapons[gun_slot]
-            pt, _ = lead_point(muzzle, center, tvel, g["stats"]["speed"])
-            aim = list(aim_at(muzzle, pt))
+            lat = self.T["aim_lat"]
+            if lat > 0:
+                # giddy: lead for decision latency and our own motion; the shot starts ~3 m out
+                mv = me["vel"]
+                mz = (muzzle[0] + mv[0] * lat, muzzle[1] + mv[1] * lat, muzzle[2])
+                tt, spd = 0.0, g["stats"]["speed"]
+                pt = center
+                for _ in range(4):
+                    pt = (center[0] + tvel[0] * (lat + tt), center[1] + tvel[1] * (lat + tt),
+                          center[2] + (tvel[2] * (lat + tt) * 0.5 if abs(tvel[2]) >= 0.5 else 0.0))
+                    tt = max(0.0, math.dist(pt, mz) - 3.0) / spd
+                aim = list(aim_at(mz, pt))
+            else:
+                pt, _ = lead_point(muzzle, center, tvel, g["stats"]["speed"])
+                aim = list(aim_at(muzzle, pt))
         laser = next((w for w in weapons if w and w["kind"] == "laser"), None)
-        if laser is not None and (laser.get("charge", 0) > 0 or gun_slot is None):
+        if laser is not None and (gun_slot is None or (
+                laser.get("charge", 0) > (0.45 * laser["stats"]["charge"] if self.T["shared_barrel"] else 0))):
             # hitscan: aim where it'll be when we release (~1 decision)
             pt = (center[0] + tvel[0] * 0.1, center[1] + tvel[1] * 0.1, center[2])
             aim = list(aim_at(muzzle, pt))
@@ -1106,13 +1458,19 @@ class Brain:
         tol_yaw = math.atan2(r * 0.85 * self.T["aim_tol_mult"], max(dist, 1.0)) + 0.008
         tol_pitch = math.atan2(h * 0.4 * self.T["aim_tol_mult"], max(dist, 1.0)) + 0.008
         on_target = yaw_err < tol_yaw and pitch_err < tol_pitch
+        gun_on = on_target
+        if self.T["slew_fire"]:
+            # the torso keeps turning this tick: fire if what's left fits in one tick (giddy)
+            tr_ = st.get("turn_rate", 4.0) * 0.05
+            pr_ = st.get("pitch_rate", st.get("turn_rate", 4.0)) * 0.05
+            gun_on = max(0.0, yaw_err - tr_) < tol_yaw and max(0.0, pitch_err - pr_) < tol_pitch
 
         for i, w in enumerate(weapons):
             if not w or fire[i]:
                 continue
             k, ws = w["kind"], w["stats"]
             if k == "gun":
-                fire[i] = clear and on_target and dist < ws["range"] and w.get("reload", 0) <= 0
+                fire[i] = clear and gun_on and dist < ws["range"] and w.get("reload", 0) <= 0
                 if w.get("ammo", 1) == 0 and not w.get("reload"):
                     reload = True
             elif k == "laser":
@@ -1138,9 +1496,17 @@ class Brain:
                             fire[i] = False
                 else:
                     fire[i] = False  # release (fires if charged) / idle
+                    # don't dump a charge into cover when LOS drops for a moment: hold up to 0.55 s
+                    if self.T["laser_hold"] and charge > 0 and kind == "mech" and not clear and                             dist < ws["range"] and charge < ws["charge"] + ws.get("hold_s", 2.0) - 0.2:
+                        if self.laser_lost_t is None:
+                            self.laser_lost_t = t
+                        fire[i] = t - self.laser_lost_t < 0.55
+                if clear:
+                    self.laser_lost_t = None
             elif k == "lightning":
                 rng_ok = dist < ws["range"] * 0.95
-                cone = math.radians(ws["cone_deg"]) * 0.8
+                cm = self.T["lightning_cone_mult"]
+                cone = math.radians(ws["cone_deg"]) * cm - (0.05 if cm <= 0.5 else 0.0)
                 fire[i] = rng_ok and abs(wrap(yaw_to(p, tp) - cur_yaw)) < cone and clear and \
                     me["energy"] > self.T["lightning_min_energy"] and w["cooldown"] <= 0
         return aim, fire, reload
