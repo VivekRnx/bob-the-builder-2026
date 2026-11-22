@@ -191,7 +191,7 @@ func DefaultParams() Params {
 		DropGreed:     0.5,
 		Hunt:          true,
 		PracticeAware: true,
-		Salt:          2,
+		Salt:          8,
 		// SlotRule stays off: the track page says the practice slot varies each match
 		FFAEngage:     1.8,
 		FFADisengage:  0.95,
@@ -294,11 +294,11 @@ func DefaultParams() Params {
 		BeamFFA:          true,
 		FinalHold:        true,
 		// Apex-Go v3 verified winners (4.99 192m grand, 6.00 TR_HK1, 9,070 dealt, 3.87x trade, 8 alive wins)
-		LaserCDTrack: true,
-		RearAvoidW:   35,
-		CoverReload:  true,
-		RetreatPest:  true,
-		PracticeRim:  0.6,
+		LaserCDTrack: false,
+		RearAvoidW:   0,
+		CoverReload:  false,
+		RetreatPest:  false,
+		PracticeRim:  0,
 	}
 }
 
